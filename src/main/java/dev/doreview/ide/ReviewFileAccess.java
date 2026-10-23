@@ -20,6 +20,9 @@ final class ReviewFileAccess {
     String relativePath(String path) {
         String base = project.getBasePath();
         if (base == null || !FileUtil.isAncestor(base, path, true)) return null;
-        return FileUtil.getRelativePath(FileUtil.toSystemIndependentName(base), FileUtil.toSystemIndependentName(path), '/');
+        String relative = FileUtil.getRelativePath(FileUtil.toSystemIndependentName(base), FileUtil.toSystemIndependentName(path), '/');
+        if (relative == null) return null;
+        for (String part : relative.split("/")) if (part.equalsIgnoreCase(".doreview") || part.equalsIgnoreCase(".git")) return null;
+        return relative;
     }
 }

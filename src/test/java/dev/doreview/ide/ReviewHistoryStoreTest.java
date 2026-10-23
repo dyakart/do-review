@@ -36,6 +36,11 @@ import java.util.Set;
 
 /** Storage tests use temporary projects and backups; they never write the user's IDE config. */
 public final class ReviewHistoryStoreTest extends BasePlatformTestCase {
+    /** Exact retired XML storage specification, used only to read compatibility fixtures. */
+    @State(name = "ReviewMarksHistory", storages = @com.intellij.openapi.components.Storage(
+            value = "review-marks-history.xml", roamingType = com.intellij.openapi.components.RoamingType.DISABLED,
+            usePathMacroManager = false))
+    private static final class LegacyXmlSpecification { }
     private ReviewHistoryStore store;
     private Path backupRoot;
 
@@ -275,7 +280,8 @@ public final class ReviewHistoryStoreTest extends BasePlatformTestCase {
 
         assertEmpty(store.history(getProject(), "a.txt").evidence());
         assertNull("Unknown schema must not be exposed as this version's state bean", store.getState());
-        var storage = ReviewHistoryStore.class.getAnnotation(State.class).storages()[0];
+        assertNull("The live service must never register an XML writer", ReviewHistoryStore.class.getAnnotation(State.class));
+        var storage = LegacyXmlSpecification.class.getAnnotation(State.class).storages()[0];
         assertEquals("Storage writes must be skipped; null getState alone could clear the component",
                 StateStorageChooserEx.Resolution.SKIP, store.getResolution(storage, StateStorageOperation.WRITE));
         assertEquals(StateStorageChooserEx.Resolution.DO, store.getResolution(storage, StateStorageOperation.READ));
@@ -741,7 +747,8 @@ public final class ReviewHistoryStoreTest extends BasePlatformTestCase {
         Path options = Path.of(getProject().getBasePath(), "test-config", "options");
         var storageManager = new ApplicationStateStorageManager(manager, null);
         storageManager.macros = List.of(new Macro("$APP_CONFIG$", options));
-        var specification = ReviewHistoryStore.class.getAnnotation(State.class).storages()[0];
+        assertFalse(com.intellij.openapi.components.PersistentStateComponent.class.isAssignableFrom(ReviewHistoryStore.class));
+        var specification = LegacyXmlSpecification.class.getAnnotation(State.class).storages()[0];
         var storage = (FileBasedStorage) storageManager.getStateStorage(specification);
         assertTrue("Storage regression must stay in its disposable fixture", storage.getFile().normalize().startsWith(Path.of(getProject().getBasePath()).normalize()));
         var substitutor = XmlElementStorage.class.getDeclaredField("pathMacroSubstitutor"); substitutor.setAccessible(true);
@@ -954,7 +961,7 @@ public final class ReviewHistoryStoreTest extends BasePlatformTestCase {
     }
 
     private int validationCacheSize(String path) throws Exception {
-        var stateField = ReviewHistoryStore.class.getDeclaredField("state"); stateField.setAccessible(true);
+        var stateField = LegacyReviewHistoryModel.class.getDeclaredField("state"); stateField.setAccessible(true);
         var file = fileState((ReviewHistoryStore.StoreState) stateField.get(store), path);
         var cacheField = ReviewHistoryStore.FileState.class.getDeclaredField("validatedCheckpoints"); cacheField.setAccessible(true);
         return ((Map<?, ?>) cacheField.get(file)).size();

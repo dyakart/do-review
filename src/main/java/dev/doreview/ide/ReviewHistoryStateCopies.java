@@ -27,7 +27,7 @@ final class ReviewHistoryStateCopies {
         return target;
     }
 
-    private static ReviewHistoryStore.FileState file(ReviewHistoryStore.FileState source) {
+    static ReviewHistoryStore.FileState file(ReviewHistoryStore.FileState source) {
         var target = new ReviewHistoryStore.FileState();
         target.path = source.path; target.revision = source.revision;
         target.snapshots = map(source.snapshots, Function.identity());

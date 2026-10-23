@@ -120,6 +120,13 @@ public final class ReviewProjectionScheduler implements Disposable {
         for (var job : active) job.cancel();
     }
 
+    /** Refreshes derived views without discarding explicit commands over frozen evidence. */
+    public void cancelProjections() {
+        ScheduledJob[] active;
+        synchronized (lock) { active = latest.values().toArray(ScheduledJob[]::new); }
+        for (var job : active) job.cancel();
+    }
+
     private void forget(ScheduledJob job) { synchronized (lock) { forgetLocked(job); } }
     private void forgetLocked(ScheduledJob job) {
         jobs.remove(job);

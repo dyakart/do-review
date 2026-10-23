@@ -1,17 +1,19 @@
 <idea-plugin require-restart="true">
     <id>dev.reviewmarks</id>
     <name>DoReview</name>
-    <version>0.2.11</version>
+    <version>0.3.0</version>
     <vendor>Artem Dyakovich</vendor>
     <description><![CDATA[
         <p><b>DoReview</b> — by Artem Dyakovich</p>
         <p>Track what you have reviewed and see what changed. Mark selected lines as reviewed
         and follow your review coverage directly in the editor.</p>
-        <p>Keep a local history of reviewed lines. Exact, unambiguous text and structural
+        <p>Share review history with your team through Git using the repository's .doreview
+        directory. Reviews from any author contribute to shared coverage. Exact, unambiguous text and structural
         context restore review coverage when code returns to a reviewed version.
         Changed enclosing context is shown in yellow. Typed context analysis supports
         Python, Tact and Tolk when their language plugins are installed; other languages
-        use a conservative whole-file context. Explicitly revoked reviews stay revoked.</p>
+        use a conservative whole-file context. Explicitly revoked reviews stay revoked.
+        DoReview does not stage, commit or push files automatically.</p>
     ]]></description>
     <depends>com.intellij.modules.platform</depends>
     <depends optional="true" config-file="review-context-python.xml">com.intellij.modules.python</depends>
@@ -54,6 +56,8 @@
                     text="Attach Review History…" description="Attach existing local review history to this file"/>
             <action id="ReviewMarks.ToggleStripe" class="dev.doreview.ide.ToggleReviewStripeAction"
                     text="Show DoReview Stripe" description="Show the review stripe in project editors"/>
+            <action id="ReviewMarks.RebuildIndex" class="dev.doreview.ide.RebuildReviewIndexAction"
+                    text="Rebuild Review Index" description="Rebuild the local review index from the shared history after exporting pending changes"/>
             <separator/>
             <action id="ReviewMarks.ClearFile" class="dev.doreview.ide.ClearFileAction"
                     text="Clear All Reviews in File" description="Revoke all reviews in the current file while retaining history"/>

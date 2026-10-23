@@ -4,8 +4,9 @@ import com.intellij.ide.plugins.PluginManagerCore;
 import com.intellij.notification.NotificationGroup;
 import com.intellij.notification.NotificationGroupManager;
 import com.intellij.openapi.actionSystem.ActionManager;
-import com.intellij.openapi.components.RoamingType;
+import com.intellij.openapi.components.PersistentStateComponent;
 import com.intellij.openapi.components.State;
+import com.intellij.openapi.components.StoragePathMacros;
 import com.intellij.openapi.extensions.PluginId;
 import com.intellij.testFramework.fixtures.BasePlatformTestCase;
 
@@ -25,19 +26,17 @@ public final class DoReviewMetadataTest extends BasePlatformTestCase {
         assertNotNull(actions.getAction("ReviewMarks.EditorGroup"));
         assertEquals("DoReview", actions.getAction("ReviewMarks.EditorGroup").getTemplatePresentation().getText());
         for (String id : List.of("ReviewMarks.Mark", "ReviewMarks.Clear", "ReviewMarks.Next", "ReviewMarks.Previous",
-                "ReviewMarks.Coverage", "ReviewMarks.Changes", "ReviewMarks.AttachHistory", "ReviewMarks.ClearFile")) {
+                "ReviewMarks.Coverage", "ReviewMarks.Changes", "ReviewMarks.AttachHistory", "ReviewMarks.ClearFile", "ReviewMarks.RebuildIndex")) {
             assertNotNull("Existing user keymap action identity must remain registered: " + id, actions.getAction(id));
         }
     }
 
-    public void testHistoryStorageAndWidgetIdentityRemainCompatibleWithTheNewBrand() {
-        State state = ReviewHistoryStore.class.getAnnotation(State.class);
-        assertNotNull(state);
-        assertEquals("ReviewMarksHistory", state.name());
-        assertEquals(1, state.storages().length);
-        assertEquals("review-marks-history.xml", state.storages()[0].value());
-        assertEquals(RoamingType.DISABLED, state.storages()[0].roamingType());
-        assertFalse("Raw source snapshots must remain opaque to IDE path macros", state.storages()[0].usePathMacroManager());
+    public void testHistoryLeavesXmlWhilePresentationAndWidgetIdentityRemainCompatible() {
+        assertNull("Migrated review history must not retain a platform XML writer", ReviewHistoryStore.class.getAnnotation(State.class));
+        assertFalse(PersistentStateComponent.class.isAssignableFrom(ReviewHistoryStore.class));
+        State settings = ReviewStripeSettings.class.getAnnotation(State.class);
+        assertNotNull(settings);
+        assertEquals(StoragePathMacros.WORKSPACE_FILE, settings.storages()[0].value());
         var widget = new ReviewCoverageWidgetFactory();
         assertEquals("ReviewMarks.Coverage", widget.getId());
         assertEquals("DoReview Coverage", widget.getDisplayName());

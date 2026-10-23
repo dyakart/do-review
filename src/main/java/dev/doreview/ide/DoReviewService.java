@@ -1,6 +1,7 @@
 package dev.doreview.ide;
 
 import com.intellij.notification.NotificationGroupManager;
+import com.intellij.AppTopics;
 import com.intellij.notification.NotificationType;
 import com.intellij.openapi.Disposable;
 import com.intellij.openapi.application.ApplicationManager;
@@ -16,6 +17,7 @@ import com.intellij.openapi.editor.event.DocumentListener;
 import com.intellij.openapi.editor.event.EditorFactoryEvent;
 import com.intellij.openapi.editor.event.EditorFactoryListener;
 import com.intellij.openapi.fileEditor.FileDocumentManager;
+import com.intellij.openapi.fileEditor.FileDocumentManagerListener;
 import com.intellij.openapi.project.Project;
 import com.intellij.openapi.util.Key;
 import com.intellij.openapi.util.io.FileUtil;
@@ -71,6 +73,7 @@ public final class DoReviewService implements Disposable {
     private boolean initialized, allRefreshPending;
     private final AtomicLong storeEpoch = new AtomicLong();
     private int pendingRevocations;
+    private final Set<String> reportedStorageWarnings = new java.util.HashSet<>();
     private volatile boolean disposed;
 
     public DoReviewService(Project project) {
@@ -78,7 +81,7 @@ public final class DoReviewService implements Disposable {
         files = new ReviewFileAccess(project);
         scheduler = new ReviewProjectionScheduler(this);
         computer = new ReviewProjectionComputer(project);
-        presentation = new ReviewEditorPresentation(project, this, this::showChanges);
+        presentation = new ReviewEditorPresentation(project, this, this::showChanges, this::authorsFor);
     }
     public static DoReviewService getInstance(Project project) {
         var service = project.getService(DoReviewService.class);
@@ -139,6 +142,8 @@ public final class DoReviewService implements Disposable {
                         .noneMatch(editor -> editor != event.getEditor() && !editor.isDisposed())) {
                     scheduler.cancel(event.getEditor().getDocument());
                     runtime.remove(event.getEditor().getDocument());
+                    String key = keyFor(event.getEditor().getDocument());
+                    if (key != null) store.release(project, key);
                 }
             }
         }, this);
@@ -148,10 +153,46 @@ public final class DoReviewService implements Disposable {
             if (ApplicationManager.getApplication().isDispatchThread()) historyReloaded();
             else ApplicationManager.getApplication().invokeLater(this::historyReloaded, project.getDisposed());
         });
+        ApplicationManager.getApplication().getMessageBus().connect(this).subscribe(ReviewHistoryStore.SHARED_UPDATES,
+                (owner, path, replacement) -> {
+                    if (owner != project) return;
+                    Runnable update = () -> {
+                        if (replacement) { storeEpoch.incrementAndGet(); historyReloaded(); return; }
+                        for (var document : List.copyOf(runtime.keySet())) {
+                            if (path != null && !path.equals(keyFor(document))) continue;
+                            scheduler.cancel(document);
+                            var state = runtime.get(document);
+                            state.stamp = -1;
+                            state.ready = false;
+                            state.hints = savedHints(document);
+                            presentation.clearConfirmed(document);
+                        }
+                        reportStorageWarnings();
+                        refreshAll();
+                    };
+                    if (ApplicationManager.getApplication().isDispatchThread()) update.run();
+                    else ApplicationManager.getApplication().invokeLater(update, project.getDisposed());
+                });
         project.getMessageBus().connect(this).subscribe(ContextAnalysisManager.CHANGED, this::contextChanged);
+        ApplicationManager.getApplication().getMessageBus().connect(this).subscribe(AppTopics.FILE_DOCUMENT_SYNC, new FileDocumentManagerListener() {
+            @Override public void beforeDocumentSaving(@NotNull Document document) {
+                String key = keyFor(document);
+                if (key != null) store.flushShared(project, key);
+            }
+        });
         project.getMessageBus().connect(this).subscribe(VirtualFileManager.VFS_CHANGES, new BulkFileListener() {
+            @Override public void before(@NotNull List<? extends VFileEvent> events) {
+                if (!store.isShared() || events.stream().noneMatch(DoReviewService::historyEvent)) return;
+                storeEpoch.incrementAndGet();
+                scheduler.cancelProjections();
+                for (var document : List.copyOf(runtime.keySet())) presentation.clearConfirmed(document);
+                runtime.clear();
+            }
             @Override public void after(@NotNull List<? extends VFileEvent> events) {
                 boolean changed = false;
+                if (store.isShared() && events.stream().anyMatch(DoReviewService::historyEvent)) {
+                    store.reloadShared(project); changed = true;
+                }
                 for (var event : events) {
                     if (event instanceof VFileMoveEvent move) {
                         movePath(move.getOldPath(), move.getNewPath());
@@ -173,15 +214,21 @@ public final class DoReviewService implements Disposable {
                         changed = true;
                     }
                 }
-                // Deletion and Git checkout never remove the history.
+                // Source edits retain evidence; shared metadata is scoped to the current checkout.
                 if (changed) refreshAll();
             }
         });
         refreshAll();
     }
     public boolean supports(Document document) { return keyFor(document) != null; }
+    private static boolean historyEvent(VFileEvent event) {
+        String path = event.getPath().replace('\\', '/');
+        return path.contains("/.doreview/") || path.endsWith("/.doreview")
+                || path.contains("/.git/") || path.endsWith("/.git");
+    }
     public ReviewHistory history(Document document) {
         String key = keyFor(document);
+        if (key != null && !store.isLoaded(project, key)) store.whenLoaded(project, key, document.getText(), null);
         return key == null ? ReviewHistory.empty() : store.history(project, key);
     }
     public FileProjection projection(Document document) {
@@ -261,11 +308,16 @@ public final class DoReviewService implements Disposable {
         String key = keyFor(document);
         if (key != null) store.checkpointPending(project, key, document.getText(), hints);
     }
-    public boolean isProjectionReady(Document document) { projection(document); return runtime.get(document).ready && pendingRevocations == 0; }
+    public boolean isProjectionReady(Document document) {
+        projection(document);
+        String key = keyFor(document);
+        return key != null && store.isLoaded(project, key) && runtime.get(document).ready && pendingRevocations == 0;
+    }
     public List<ReviewedRange> getRanges(Document document) { return projection(document).reviewedRanges(); }
     public void mark(Document document, int start, int end) {
         String key = keyFor(document);
         if (key == null || start >= end) return;
+        if (deferUntilLoaded(document, () -> mark(document, start, end))) return;
         projection(document);
         if (store.mark(project, key, document.getText(), start, end) == null) return;
         var state = runtime.get(document);
@@ -276,6 +328,7 @@ public final class DoReviewService implements Disposable {
     }
     public void toggle(Document document, int start, int end) {
         if (start >= end) return;
+        if (deferUntilLoaded(document, () -> toggle(document, start, end))) return;
         var current = projection(document);
         boolean hasNonblank = false, allReviewed = true;
         for (var row : current.rows()) {
@@ -292,6 +345,7 @@ public final class DoReviewService implements Disposable {
     public void clear(Document document, int start, int end) {
         String key = keyFor(document);
         if (key == null) return;
+        if (deferUntilLoaded(document, () -> clear(document, start, end))) return;
         var current = projection(document);
         var before = history(document);
         var state = runtime.get(document);
@@ -305,21 +359,34 @@ public final class DoReviewService implements Disposable {
         // older variants from the captured version, without touching subsequently created proofs.
         if (!state.ready) {
             long epoch = storeEpoch.get();
+            boolean sharedCommand = store.isShared();
+            String checkout = store.checkoutToken(project, key);
             var file = FileDocumentManager.getInstance().getFile(document);
             pendingRevocations++;
             scheduler.submit(() -> computer.capture(before, file, text),
                     contexts -> computer.project(before, text, hints, contexts), resolved -> {
-                        pendingRevocations--;
-                        if (epoch != storeEpoch.get()) return;
                         var related = resolved.rows().stream().filter(row -> row.start() < end && row.end() > start)
                                 .flatMap(row -> row.revocableRefs().stream()).distinct().toList();
-                        // Proof ownership stays stable when the file is renamed, deleted or its old path reused.
-                        store.revokeByEvidence(project, related);
-                        invalidate(document);
+                        Runnable finish = () -> {
+                            try {
+                            if (disposed || sharedCommand != store.isShared()) return;
+                            if (sharedCommand ? !java.util.Objects.equals(checkout, store.checkoutToken(project, key))
+                                    : epoch != storeEpoch.get()) return;
+                            // Proof ownership stays stable when the path changes. A branch
+                            // switch cannot route a previous checkout's command into this one.
+                            store.revokeByEvidence(project, related);
+                            invalidate(document);
+                            } finally {
+                                pendingRevocations--;
+                                refreshDocument(document);
+                            }
+                        };
+                        if (sharedCommand) store.whenLoaded(project, key, text, finish);
+                        else finish.run();
                     }, failure -> {
                         if (disposed) return;
                         pendingRevocations--;
-                        if (epoch == storeEpoch.get()) {
+                        if (sharedCommand || epoch == storeEpoch.get()) {
                             LOG.warn("Could not finish revoking historical review variants", failure);
                             notifyInfo("Could not revoke all historical versions. Use Clear All Reviews in File or retry.");
                             refreshDocument(document);
@@ -331,6 +398,7 @@ public final class DoReviewService implements Disposable {
     public void clearFile(Document document) {
         String key = keyFor(document);
         if (key == null) return;
+        if (deferUntilLoaded(document, () -> clearFile(document))) return;
         store.clearFile(project, key);
         invalidate(document);
     }
@@ -339,15 +407,34 @@ public final class DoReviewService implements Disposable {
         if (state != null) state.stamp = -1;
         refreshDocument(document);
     }
+    private boolean deferUntilLoaded(Document document, Runnable command) {
+        String key = keyFor(document);
+        if (key == null || store.isLoaded(project, key)) return false;
+        long stamp = document.getModificationStamp();
+        store.whenLoaded(project, key, document.getText(), () -> {
+            if (disposed) return;
+            if (document.getModificationStamp() == stamp) command.run();
+            else notifyInfo("The file changed while review history was loading. Review the current selection again.");
+        });
+        return true;
+    }
+    String authorsFor(Document document, List<dev.doreview.core.EvidenceRef> refs) {
+        String key = keyFor(document);
+        return key == null ? "" : store.authors(project, key, refs);
+    }
     public void historyReloaded() {
         if (!ApplicationManager.getApplication().isDispatchThread()) {
             ApplicationManager.getApplication().invokeLater(this::historyReloaded, project.getDisposed());
             return;
         }
-        scheduler.cancelAll();
-        pendingRevocations = 0;
+        if (store.isShared()) scheduler.cancelProjections();
+        else { scheduler.cancelAll(); pendingRevocations = 0; }
         runtime.clear();
+        reportStorageWarnings();
         refreshAll();
+    }
+    private void reportStorageWarnings() {
+        for (String warning : store.diagnostics(project)) if (reportedStorageWarnings.add(warning)) notifyInfo(warning);
     }
     private void contextChanged() {
         for (var document : List.copyOf(runtime.keySet())) {
@@ -394,6 +481,15 @@ public final class DoReviewService implements Disposable {
     public List<ReviewVersion> reviewVersions(Document document) { return historyActions.versions(document); }
     public void showChanges(Document document) { historyActions.showChanges(document); }
     public void reattachHistory(Document document) { historyActions.reattachHistory(document); }
+    public void rebuildIndex(Document document) {
+        String key = keyFor(document);
+        if (key != null) store.rebuild(project, key, backup -> notifyInfo("Review index rebuilt. Database backup: " + backup));
+    }
+    String storageStatus(Document document) {
+        String key = keyFor(document);
+        if (key == null || store.isLoaded(project, key)) return null;
+        return store.diagnostics(project).isEmpty() ? "loading" : "unavailable";
+    }
     private String keyFor(Document document) { return files.relativePath(document); }
     private String keyForPath(String path) { return files.relativePath(path); }
     private boolean movePath(String oldPath, String newPath) {
@@ -438,6 +534,7 @@ public final class DoReviewService implements Disposable {
                 .createNotification(text, NotificationType.INFORMATION).setTitle("DoReview").notify(project);
     }
     @Override public void dispose() {
+        if (store != null) store.projectClosed(project);
         disposed = true;
         scheduler.dispose();
         presentation.dispose();

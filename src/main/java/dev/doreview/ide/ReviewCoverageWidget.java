@@ -118,6 +118,12 @@ public final class ReviewCoverageWidget extends EditorBasedWidget
                         + "; needs review: " + coverage.needsReview()
                         + "; deleted reviewed lines: " + coverage.deleted()
                         + ". Click to compare with a reviewed version.";
+                String storage = service.storageStatus(editor.getDocument());
+                if (storage != null) {
+                    nextText = "DoReview " + storage;
+                    nextTooltip = storage.equals("loading") ? "Reading review history…"
+                            : "Review history could not be loaded. See the DoReview notification for details.";
+                }
             }
         }
         text = nextText;

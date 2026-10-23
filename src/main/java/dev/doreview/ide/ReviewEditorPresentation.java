@@ -18,6 +18,7 @@ import com.intellij.openapi.editor.markup.RangeHighlighter;
 import com.intellij.openapi.project.Project;
 import com.intellij.openapi.util.Disposer;
 import dev.doreview.core.FileProjection;
+import dev.doreview.core.EvidenceRef;
 import org.jetbrains.annotations.NotNull;
 
 import javax.swing.Icon;
@@ -27,6 +28,8 @@ import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
+import java.util.function.BiFunction;
 import java.util.function.Consumer;
 
 /** Owns editor resources only. It consumes immutable projections and never queries storage or PSI. */
@@ -37,14 +40,21 @@ final class ReviewEditorPresentation implements Disposable {
             new CustomShortcutSet(KeyStroke.getKeyStroke("alt shift M"));
     private final Project project;
     private final Consumer<Document> showChanges;
+    private final BiFunction<Document, List<EvidenceRef>, String> authors;
     private final ReviewStripePresentation stripe;
     private final Map<Editor, List<RangeHighlighter>> highlights = new IdentityHashMap<>();
     private final Map<Editor, Disposable> shortcuts = new IdentityHashMap<>();
     private volatile boolean disposed;
 
     ReviewEditorPresentation(Project project, Disposable parent, Consumer<Document> showChanges) {
+        this(project, parent, showChanges, (document, refs) -> "");
+    }
+
+    ReviewEditorPresentation(Project project, Disposable parent, Consumer<Document> showChanges,
+            BiFunction<Document, List<EvidenceRef>, String> authors) {
         this.project = project;
         this.showChanges = showChanges;
+        this.authors = Objects.requireNonNull(authors, "authors");
         Disposer.register(parent, this);
         stripe = new ReviewStripePresentation(project, this);
     }
@@ -59,11 +69,13 @@ final class ReviewEditorPresentation implements Disposable {
         var runs = new ArrayList<HighlightRun>();
         for (var row : projection.rows()) {
             if (row.status() == FileProjection.Status.UNREVIEWED) continue;
-            var current = new HighlightRun(row.start(), row.end(), row.status(), row.reason());
+            String authorNames = Objects.toString(authors.apply(editor.getDocument(), row.evidenceRefs()), "").strip();
+            var current = new HighlightRun(row.start(), row.end(), row.status(), row.reason(), authorNames);
             if (!runs.isEmpty()) {
                 var prior = runs.getLast();
-                if (prior.end() == current.start() && prior.status() == current.status() && prior.reason() == current.reason()) {
-                    runs.set(runs.size() - 1, new HighlightRun(prior.start(), current.end(), current.status(), current.reason()));
+                if (prior.end() == current.start() && prior.status() == current.status() && prior.reason() == current.reason()
+                        && prior.authors().equals(current.authors())) {
+                    runs.set(runs.size() - 1, new HighlightRun(prior.start(), current.end(), current.status(), current.reason(), current.authors()));
                     continue;
                 }
             }
@@ -84,8 +96,9 @@ final class ReviewEditorPresentation implements Disposable {
             String reason = green ? "Reviewed — exact text and context confirmed"
                     : yellow ? "Needs review: " + run.reason().name().toLowerCase(Locale.ROOT).replace('_', ' ')
                     : "Changed since review";
-            highlighter.setGutterIconRenderer(new ReviewGutterIcon(green, reason, () -> showChanges.accept(editor.getDocument())));
-            highlighter.setErrorStripeTooltip(reason);
+            highlighter.setGutterIconRenderer(new ReviewGutterIcon(green, tooltip(reason, run.authors(), true),
+                    () -> showChanges.accept(editor.getDocument())));
+            highlighter.setErrorStripeTooltip(tooltip(reason, run.authors(), false));
             created.add(highlighter);
         }
         if (!created.isEmpty()) highlights.put(editor, created);
@@ -158,7 +171,18 @@ final class ReviewEditorPresentation implements Disposable {
         else ApplicationManager.getApplication().invokeLater(cleanup);
     }
 
-    private record HighlightRun(int start, int end, FileProjection.Status status, FileProjection.Reason reason) { }
+    private record HighlightRun(int start, int end, FileProjection.Status status, FileProjection.Reason reason, String authors) { }
+
+    private static String tooltip(String reason, String authors, boolean compare) {
+        if (authors.isBlank()) return reason + (compare ? " — click to compare" : "");
+        return "<html>" + escapeHtml(reason) + "<br>Review authors: " + escapeHtml(authors)
+                + (compare ? "<br>Click to compare" : "") + "</html>";
+    }
+
+    private static String escapeHtml(String value) {
+        return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                .replace("\"", "&quot;").replace("'", "&#39;");
+    }
 
     private static final class ReviewGutterIcon extends GutterIconRenderer {
         private final boolean green;
@@ -172,7 +196,7 @@ final class ReviewEditorPresentation implements Disposable {
         }
 
         @Override public @NotNull Icon getIcon() { return green ? AllIcons.General.InspectionsOK : AllIcons.General.Warning; }
-        @Override public String getTooltipText() { return tooltip + " — click to compare"; }
+        @Override public String getTooltipText() { return tooltip; }
         @Override public boolean isNavigateAction() { return true; }
         @Override public @NotNull AnAction getClickAction() {
             return new AnAction() { @Override public void actionPerformed(@NotNull AnActionEvent event) { compare.run(); } };
