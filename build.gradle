@@ -41,6 +41,8 @@ dependencies {
         def codeGlancePath = providers.gradleProperty('codeGlancePluginPath').orNull
         if (codeGlancePath != null) localPlugin file(codeGlancePath)
     }
+    implementation 'org.xerial:sqlite-jdbc:3.53.4.0'
+    implementation 'com.google.code.gson:gson:2.13.2'
     testImplementation 'junit:junit:4.13.2'
 }
 
@@ -57,6 +59,10 @@ java {
 tasks.withType(JavaCompile).configureEach {
     options.encoding = 'UTF-8'
     options.compilerArgs += ['-Xlint:deprecation']
+}
+
+tasks.named('processResources') {
+    from('docs/THIRD_PARTY_LICENSES.md') { into 'META-INF' }
 }
 
 intellijPlatform {
@@ -79,6 +85,7 @@ tasks.register('rangeEngineTest', JavaExec) {
 check.dependsOn rangeEngineTest
 
 test {
+    systemProperty 'doreview.data.path', layout.buildDirectory.dir('test-data/review-history').get().asFile.absolutePath
     def auditCorpus = providers.gradleProperty('reviewCorpus').orNull
     if (auditCorpus != null) {
         systemProperty 'reviewMarks.corpus', auditCorpus
