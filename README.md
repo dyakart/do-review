@@ -1,12 +1,13 @@
 # DoReview
 
-Personal code review tracking with persistent history.
+Track reviewed lines and share review history with your team through Git.
 
 **Supported IDE:** PyCharm 2026.2 (IntelliJ Platform 262.*).
 
 ## Features
 
 - Mark individual lines or selections; blank lines are skipped.
+- Share reviews from any team member through the repository's `.doreview` directory.
 - Track changes to reviewed text and its syntax context, with version comparison and deleted-line indicators.
 - Keep review history across edits, Undo/Redo and Git branch changes. Exact, unambiguous matches restore marks; explicitly cleared marks stay cleared.
 - Show an optional review stripe aligned with the CodeGlance minimap, or a whole-file overview when CodeGlance is unavailable.
@@ -23,7 +24,7 @@ Green marks indicate reviewed text with matching context. Yellow marks require r
 
 The **DoReview** menu provides version comparison, history management and **Show DoReview Stripe**. Stripe visibility is saved per project and is off by default.
 
-Structural context tracking supports Python, Tact and Tolk through their language plugins. Other languages use a whole-file fingerprint, so edits require rechecking unchanged reviewed lines. Marks track text and syntax context; they do not establish program correctness.
+Python, Tact and Tolk use their language plugins for structural context. Other languages use a conservative whole-file fingerprint. Marks track text and syntax context; they do not establish program correctness.
 
 ## Installation
 
@@ -33,11 +34,17 @@ On Windows, build using an installed PyCharm 2026.2:
 .\build.ps1
 ```
 
-In PyCharm, open **Settings → Plugins → ⚙ → Install Plugin from Disk…** and select the ZIP in `build/distributions/`.
+In PyCharm, open **Settings → Plugins → ⚙ → Install Plugin from Disk…**, select the ZIP in `build/distributions/` and restart the IDE.
 
-## Storage
+## Shared history
 
-History, including full source snapshots, is stored locally in the IDE configuration directory as `review-marks-history.xml`, outside the project repository. Settings Sync is disabled for this history, and DoReview does not send source code over the network.
+After the first review, DoReview writes immutable JSON events and deduplicated full source snapshots to `.doreview/v1/` at the Git working-tree root, or project directory without Git. Include these files in normal commits; DoReview does not stage, commit or push. Valid reviews from any author contribute to shared coverage. Each checkout uses its own working-tree history. Authors use Git name/email configuration, falling back to the operating-system username.
+
+A local SQLite database indexes each working tree independently of the IDE version. On Windows: `%LOCALAPPDATA%/DoReview/worktrees/<root-hash>/history.sqlite3`. It also holds pending provenance until publication to `.doreview`; preserve the database when backing up unpublished work. Database files stay outside Git.
+
+Existing XML history is imported automatically as **Imported history**, with an XML backup retained. See [Architecture](docs/ARCHITECTURE.md) for storage details.
+
+Use **DoReview → Rebuild Review Index** to export pending work, back up SQLite and rebuild its index. Retained work from another checkout must be published there first. Restore missing or damaged `.doreview` files from Git before rebuilding.
 
 ## Development
 
@@ -45,4 +52,4 @@ See [Development](docs/DEVELOPMENT.md) for build and test commands and [Architec
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE). Bundled dependencies retain their [third-party licenses](docs/THIRD_PARTY_LICENSES.md).

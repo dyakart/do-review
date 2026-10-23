@@ -1,57 +1,62 @@
 # Architecture
 
-DoReview is a local IntelliJ Platform plugin for PyCharm 2026.2 (platform 262). It tracks explicit review evidence and projects that evidence onto the current document. A green mark confirms matching text, origin and tracked syntax context; it does not establish semantic equivalence or analyze dependencies between functions.
+DoReview targets PyCharm 2026.2 (platform 262). It shares review evidence through Git and projects it onto current documents. Green confirms matching text, origin and tracked syntax context; it does not establish program correctness.
 
 ## Components
-
-Production code lives under `src/main/java/dev/doreview`.
 
 | Component | Responsibility |
 | --- | --- |
 | `core` | Immutable snapshots, evidence, revocations, row identity and matching. Depends only on `java.base`; `compileCoreIsolation` enforces this boundary. |
-| `DoReviewService` | Project session, commands, document/VFS events and projection coordination. |
+| `DoReviewService` | Project commands, document/VFS events and projection coordination. |
 | `ReviewProjectionScheduler`, `ReviewProjectionComputer` | Cancellable context capture, background matching and guarded delivery. |
-| `ContextAnalysisManager`, `ContextProvider` | Cached context maps and optional language adapters. |
-| `ReviewHistoryStore` and codecs | Application persistence, validation, migration and checkpoint commits. |
+| `ContextAnalysisManager`, `ContextProvider` | Context caches and optional language adapters. |
+| `ReviewHistoryStore`, `SharedReviewHistoryStore`, `LegacyReviewHistoryModel` | Facade, serial persistence coordinator and legacy compatibility model. |
+| `SharedHistoryRepository`, `ReviewRepositoryPaths` | Portable events, SQLite storage, checkout reconciliation and filesystem identity. |
 | `ReviewEditorPresentation`, stripe classes | Editor resources and rendering from immutable `FileProjection` values. |
-| `ReviewHistoryActions` | Reviewed-version selection, native diff and explicit history attachment. |
+| `ReviewHistoryActions` | Version comparison, authors and explicit history attachment. |
 
 ## Review model
 
-`ReviewHistory` holds content-addressed `FileSnapshot` values, explicit `ReviewEvidence` and `Revocation` records. Edits change the projection, not the saved evidence. A revocation targets particular evidence and rows; returning to old text must not override it. A later explicit review creates fresh evidence.
+`ReviewHistory` contains content-addressed `FileSnapshot` values, explicit `ReviewEvidence` and targeted `Revocation` records. Edits change the projection, not saved evidence. Returning to old text cannot override an explicit revocation; a later review creates new evidence.
 
-`FileProjection` is the shared interpretation used by highlighting, coverage and navigation. Matching requires exact text and unambiguous origin before context can confirm a review. Local edit hints preserve original-row identity, so inserting an identical copy does not review the copy. Ambiguous external changes remain unconfirmed. Checkpoints preserve these constraints across editor closure and restart; hints cannot create evidence.
-
-Blank rows are excluded from marking, coverage and deletion markers. Projection work shares a budget of four million quadratic diff cells. Exhaustion leaves unresolved matches unconfirmed rather than guessing; this is not a wall-clock limit.
+Green requires exact text, unambiguous origin and matching context. Local edit hints preserve original-row identity, so inserting an identical copy does not review the copy. Ambiguous external changes remain unconfirmed. Blank rows are excluded from marking, coverage and deletion markers. Projection work shares a four-million-cell quadratic diff budget; unresolved matches remain unconfirmed when it is exhausted.
 
 ## Execution and concurrency
 
-The project service and editor presentation run on the event dispatch thread (EDT). The scheduler replaces previous projection work for a document; frozen revocation commands run independently so ordinary refreshes cannot supersede them.
+`DoReviewService` and presentation run on the event dispatch thread (EDT). Context capture uses a cancellable non-blocking read action and returns immutable maps; PSI never leaves that phase. Matching and checkpoint preparation run outside the read lock in a separate pooled task. Projection jobs replace older document jobs; frozen revocations survive view refreshes within their checkout.
 
-`ReviewProjectionComputer.capture` reads PSI under a cancellable non-blocking read action and returns immutable context maps. PSI objects never leave this phase. Matching and checkpoint preparation run in a separate pooled task outside the read lock, with independent cancellation indicators.
+Delivery checks document identity, modification stamp, task generation, history revision, storage epoch and context-provider generation. `beforeDocumentChange` synchronously clears confirmed highlighting and stripe snapshots before range markers can expand over inserted text.
 
-Before applying a result on EDT, the service checks document identity, modification stamp, task generation, history revision, storage reload epoch and context-provider generation. A checkpoint commit additionally requires the same immutable history instance used by the worker. Cancellation or failure cannot publish confirmed stale marks.
+Persistence uses an application-owned serial worker. Initial loading, filesystem scans, database work and cold decoding run off EDT; UI consumers use warmed immutable models. Queued writes carry frozen state. Cancellation or failure must not publish stale green marks.
 
-`beforeDocumentChange` synchronously clears confirmed highlighting and stripe snapshots before editor range markers can expand over inserted text. New marks appear only after the applicable projection is available.
+## Shared artifacts and local storage
 
-## Persistence and compatibility
+The nearest ancestor Git working-tree root owns `.doreview`; a nested repository or submodule is a separate boundary. Without Git, the project base directory is the root. Portable paths are relative to that root.
 
-`ReviewHistoryStore` persists schema 2 in the application configuration file `review-marks-history.xml`, keyed by canonical project path. Branches in one checkout share history; separate project roots and worktrees have separate keys. Settings Sync is disabled for this storage. Source text is stored literally: path macro substitution is disabled, including strings such as `$USER_HOME$`.
+Each operation publishes an immutable JSON batch at `.doreview/v1/events/<prefix>/<uuid>.json`. Events carry author identity, evidence, revocations, aliases, checkpoint constraints and causal parents. LF-normalized UTF-8 snapshots are deduplicated at `.doreview/v1/snapshots/<prefix>/<sha256>.txt`. Snapshot hashes are validated, and `.doreview/.gitattributes` prevents line-ending conversion. Review authors come from Git name/email configuration, falling back to the operating-system username. Any author's valid evidence contributes to coverage.
 
-`ReviewJournalCodec` validates immutable domain values; `ReviewHistoryStateCopies` detaches persistence DTOs. `ProjectionCheckpointCodec` writes checksum-protected checkpoint v2 and reads v1. Checkpoints are derived identity constraints, not review evidence. Schema 1 recovery validates hashes; unknown journal schemas remain read-only. Legacy `.idea/review-marks.xml` is imported once from saved text with a backup in `review-marks-legacy-backups`.
+Git sharing uses ordinary user commits and pushes. DoReview does not stage files, commit or contact a remote. Rescans reconcile additions and removals: each checkout uses its working-tree event set, not the accumulated union of previously visited branches.
 
-Preserve plugin ID `dev.reviewmarks`, action IDs `ReviewMarks.*`, widget ID `ReviewMarks.Coverage`, extension point `dev.reviewmarks.contextProvider` and color keys `REVIEW_MARKS_REVIEWED` / `REVIEW_MARKS_NEEDS_REVIEW`. Stripe visibility is separate project state: `DoReviewStripeSettings.showReviewStripe` in `workspace.xml`, defaulting to false.
+SQLite stores the local index, compressed snapshot copies and pending provenance. On Windows its path is `%LOCALAPPDATA%/DoReview/worktrees/<canonical-root-SHA256>/history.sqlite3`; macOS uses `~/Library/Application Support/DoReview`, and Linux uses `$XDG_DATA_HOME/DoReview` or `~/.local/share/DoReview` as the data root. `doreview.data.path` overrides that root for isolated tests. Worktree keys resolve real paths where possible and fold case on Windows.
+
+The database uses schema 1, WAL, full synchronization and a bounded busy timeout. Pending provenance is checkout-bound and durable until successfully published; the database must not be treated as a disposable cache while pending work exists. Database files stay outside Git. `SharedHistoryRepository.backup` uses SQLite's backup API to include committed WAL contents consistently.
+
+Existing XML history is imported in the background as **Imported history**, preserving an XML backup in the IDE configuration's `review-marks-legacy-backups` directory. Imported checkpoints merge independently with current provenance; validation preserves origin denials and never creates review evidence.
+
+**Rebuild Review Index** first publishes pending work for the active checkout, refuses to discard retained work from other checkouts or missing causal parents, and creates a consistent `history-before-rebuild-*.sqlite3` backup beside the database. It then reconstructs derived tables from `.doreview`. Missing or corrupted shared artifacts must be restored from Git first; rebuilding cannot repair the portable source. Unsupported formats are preserved without being overwritten. Successful legacy migration is recorded per project so future starts do not deserialize the global XML archive again.
+
+Preserve plugin ID `dev.reviewmarks`, action IDs `ReviewMarks.*`, widget ID `ReviewMarks.Coverage`, extension point `dev.reviewmarks.contextProvider` and color keys `REVIEW_MARKS_REVIEWED` / `REVIEW_MARKS_NEEDS_REVIEW`. Stripe visibility remains separate project state in `workspace.xml`, defaulting to false.
 
 ## Language context
 
-Python, Tact and Tolk adapters load through optional plugin descriptors. They fingerprint enclosing declarations, control-flow headers, branch roles and preceding guards or early exits. Unsupported languages use a whole-file fingerprint, so any file change invalidates their context. Provider failures and uncertain parse regions produce unknown context.
+Optional Python, Tact and Tolk adapters fingerprint declarations, control-flow headers, branch roles and preceding guards or early exits. Unsupported languages use a whole-file fingerprint. Provider failures and uncertain parse regions produce unknown context.
 
-Tact assembly declarations include both header and complete body in their fingerprint: changing any instruction requires rechecking that declaration. Parse recovery can confirm independently closed declarations only with verified boundaries. `TactSyntaxRecovery` uses lexer-checked boundaries and one bounded parse of an in-memory masked copy; it never repairs the source document. Historical context analysis and caches are bounded. Provider changes invalidate caches and projections through a generation counter.
+Tact assembly fingerprints include the header and complete body. Recovery requires verified declaration boundaries. `TactSyntaxRecovery` performs one bounded parse of an in-memory masked copy with lexer-checked boundaries; it never repairs source. Analysis and caches are bounded; provider changes invalidate them and projections through a generation counter.
 
-## Editor and stripe lifecycle
+## Editor lifecycle and stripe
 
-Presentation owns only its own highlighters, shortcuts, listeners and panels through `Disposable`. Logical stripe snapshots are shared per document and modification stamp; geometry belongs to each editor, including split editors. Painting reads cached snapshots, never history or PSI. Closing an editor or disabling the stripe releases its resources.
+Presentation owns highlighters, shortcuts, listeners and panels through `Disposable`. Logical stripe snapshots are shared per document and modification stamp; geometry belongs to each editor, including splits. Painting reads cached snapshots, never history or PSI.
 
-The stripe is 14 logical pixels wide. Raster overlap priority is deletion, change, recheck, reviewed. `ReviewStripeHost` isolates SDK-specific attachment through `TextEditorComponent.__add`; it skips unsupported hosts and occupied columns. A hierarchy listener handles editors whose host appears later.
+The stripe is 14 logical pixels wide. Raster priority is deletion, change, recheck, reviewed. `ReviewStripeHost` isolates SDK-specific attachment through `TextEditorComponent.__add`, skips unsupported hosts and handles delayed attachment.
 
-`ReviewStripeCodeGlanceBridge` optionally reads a live CodeGlance minimap through guarded reflection, including private `minimap` access. This is an internal compatibility bridge, not a public CodeGlance API. It uses native row corrections, crop position and scale to align with Git markers, without reparenting CodeGlance components or retaining its classloader through strong caches. Unavailable geometry falls back to a whole-file overview. Click/drag uses the matching inverse transform and scrolls to the selected code; wheel events go to the editor. A 100 ms Swing timer follows asynchronous minimap geometry only while the stripe is showing and stops on disposal.
+`ReviewStripeCodeGlanceBridge` reads a live minimap through guarded internal reflection, including private `minimap` access. Native row corrections, crop position and scale align marks with CodeGlance's Git markers. The bridge never reparents CodeGlance components or retains its classloader through strong caches. Unavailable geometry falls back to a whole-file overview. Click/drag navigates through the matching inverse transform; wheel events go to the editor. A 100 ms timer follows asynchronous minimap geometry while showing and stops on disposal.
