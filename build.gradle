@@ -1,0 +1,135 @@
+import org.jetbrains.intellij.platform.gradle.TestFrameworkType
+
+plugins {
+    id 'java'
+    id 'org.jetbrains.intellij.platform' version '2.19.0'
+}
+
+group = 'dev.doreview'
+version = '0.2.11'
+
+repositories {
+    mavenCentral()
+    intellijPlatform { defaultRepositories() }
+}
+
+dependencies {
+    intellijPlatform {
+        def installedIde = providers.gradleProperty('localIdePath').orNull
+        if (installedIde != null) {
+            local(installedIde)
+        } else {
+            pycharm('2026.2.3')
+        }
+        bundledPlugin 'PythonCore'
+        def userPluginRoot = new File(System.getenv('APPDATA') ?: '.', 'JetBrains/PyCharm2026.2/plugins')
+        def tactPlugin = providers.gradleProperty('tactPluginPath').map { file(it) }
+                .getOrElse(new File(userPluginRoot, 'Intelli Tact'))
+        def tonPlugin = providers.gradleProperty('tonPluginPath').map { file(it) }
+                .getOrElse(new File(userPluginRoot, 'intellij-ton'))
+        if (new File(tactPlugin, 'lib/Intelli Tact-0.1.2.jar').isFile()) {
+            localPlugin tactPlugin
+        } else {
+            plugin 'org.tonstudio.tact', '0.1.2'
+        }
+        if (new File(tonPlugin, 'lib/intellij-ton-4.1.0.jar').isFile()) {
+            localPlugin tonPlugin
+        } else {
+            plugin 'org.ton.intellij-ton', '4.1.0'
+        }
+        testFramework TestFrameworkType.Platform.INSTANCE
+        def codeGlancePath = providers.gradleProperty('codeGlancePluginPath').orNull
+        if (codeGlancePath != null) localPlugin file(codeGlancePath)
+    }
+    testImplementation 'junit:junit:4.13.2'
+}
+
+// Optional integration tests compile against the real local CodeGlance; production has no dependency.
+if (providers.gradleProperty('codeGlancePluginPath').isPresent()) {
+    sourceSets.test.java.srcDir('src/codeGlanceTest/java')
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_25
+    targetCompatibility = JavaVersion.VERSION_25
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.compilerArgs += ['-Xlint:deprecation']
+}
+
+intellijPlatform {
+    buildSearchableOptions = false
+    pluginConfiguration {
+        ideaVersion {
+            sinceBuild = '262'
+            untilBuild = '262.*'
+        }
+    }
+}
+
+tasks.register('rangeEngineTest', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'dev.doreview.core.RangeEngineTest'
+    enableAssertions = true
+}
+
+check.dependsOn rangeEngineTest
+
+test {
+    def auditCorpus = providers.gradleProperty('reviewCorpus').orNull
+    if (auditCorpus != null) {
+        systemProperty 'reviewMarks.corpus', auditCorpus
+    } else {
+        exclude '**/ide/ContractCorpusAuditTest.class'
+    }
+    // External parser plugins bundle Kotlin 1.9 for their isolated IDE classloaders.
+    // Tests use a flat classpath: use the platform's Kotlin runtime instead.
+    classpath = classpath.filter { !it.name.startsWith('kotlin-stdlib-')
+            && !it.name.startsWith('kotlinx-serialization-') }
+    exclude '**/core/RangeEngineTest.class'
+    exclude '**/core/SnapshotReconcilerTest.class'
+    exclude '**/core/LineReviewTrackerTest.class'
+    exclude '**/core/ReviewHistoryEngineTest.class'
+}
+
+tasks.register('snapshotReconcilerTest', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'dev.doreview.core.SnapshotReconcilerTest'
+    enableAssertions = true
+}
+
+check.dependsOn snapshotReconcilerTest
+
+tasks.register('lineReviewTrackerTest', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'dev.doreview.core.LineReviewTrackerTest'
+    enableAssertions = true
+}
+
+check.dependsOn lineReviewTrackerTest
+
+tasks.register('reviewHistoryEngineTest', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'dev.doreview.core.ReviewHistoryEngineTest'
+    enableAssertions = true
+}
+
+check.dependsOn reviewHistoryEngineTest
+
+// A real compilation boundary: domain code may depend only on the JDK base module.
+tasks.register('compileCoreIsolation', JavaCompile) {
+    source = fileTree('src/main/java/dev/doreview/core') { include '**/*.java' }
+    destinationDirectory = layout.buildDirectory.dir('architecture/core')
+    classpath = files()
+    sourceCompatibility = JavaVersion.VERSION_25
+    targetCompatibility = JavaVersion.VERSION_25
+    options.compilerArgs += ['--limit-modules', 'java.base']
+}
+
+check.dependsOn compileCoreIsolation

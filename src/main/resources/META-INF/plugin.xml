@@ -1,0 +1,62 @@
+<idea-plugin>
+    <id>dev.reviewmarks</id>
+    <name>DoReview</name>
+    <version>0.2.11</version>
+    <vendor>Artem Dyakovich</vendor>
+    <description><![CDATA[
+        <p><b>DoReview</b> — by Artem Dyakovich</p>
+        <p>Track what you have reviewed and see what changed. Mark selected lines as reviewed
+        and follow your review coverage directly in the editor.</p>
+        <p>Keep a local history of reviewed lines. Exact, unambiguous text and structural
+        context restore review coverage when code returns to a reviewed version.
+        Changed enclosing context is shown in yellow. Typed context analysis supports
+        Python, Tact and Tolk when their language plugins are installed; other languages
+        use a conservative whole-file context. Explicitly revoked reviews stay revoked.</p>
+    ]]></description>
+    <depends>com.intellij.modules.platform</depends>
+    <depends optional="true" config-file="review-context-python.xml">com.intellij.modules.python</depends>
+    <depends optional="true" config-file="review-context-tact.xml">org.tonstudio.tact</depends>
+    <depends optional="true" config-file="review-context-tolk.xml">org.ton.intellij-ton</depends>
+
+    <extensionPoints>
+        <extensionPoint name="contextProvider" interface="dev.doreview.ide.context.ContextProvider" dynamic="true"/>
+    </extensionPoints>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <postStartupActivity implementation="dev.doreview.ide.ReviewStartupActivity"/>
+        <statusBarWidgetFactory id="ReviewMarks.Coverage"
+                                implementation="dev.doreview.ide.ReviewCoverageWidgetFactory"/>
+        <notificationGroup id="Review Marks" bundle="messages.DoReviewBundle" key="notification.group.name"
+                           displayType="BALLOON" isLogByDefault="true"/>
+        <additionalTextAttributes scheme="Default" file="colorSchemes/DoReviewLight.xml"/>
+        <additionalTextAttributes scheme="Darcula" file="colorSchemes/DoReviewDark.xml"/>
+    </extensions>
+
+    <actions>
+        <group id="ReviewMarks.EditorGroup" text="DoReview" popup="true">
+            <add-to-group group-id="EditorPopupMenu" anchor="last"/>
+            <action id="ReviewMarks.Mark" class="dev.doreview.ide.MarkReviewedAction"
+                    text="Toggle Reviewed" description="Toggle review marks on selected lines, or the current line">
+                <keyboard-shortcut keymap="$default" first-keystroke="control M"/>
+            </action>
+            <action id="ReviewMarks.Clear" class="dev.doreview.ide.ClearReviewedAction"
+                    text="Clear Review in Selection" description="Revoke review on selected lines, or the current line"/>
+            <separator/>
+            <action id="ReviewMarks.Next" class="dev.doreview.ide.NextUnreviewedAction"
+                    text="Next Unreviewed Line" description="Move to the end of the next unreviewed non-blank line (Alt+M in code editors)"/>
+            <action id="ReviewMarks.Previous" class="dev.doreview.ide.PreviousUnreviewedAction"
+                    text="Previous Unreviewed Line" description="Move to the end of the previous unreviewed non-blank line (Alt+Shift+M in code editors)"/>
+            <action id="ReviewMarks.Coverage" class="dev.doreview.ide.ShowCoverageAction"
+                    text="Show File Review Coverage" description="Show reviewed non-blank lines in the current file"/>
+            <action id="ReviewMarks.Changes" class="dev.doreview.ide.ShowReviewChangesAction"
+                    text="Show Review Changes" description="Show review history and changed context for this file"/>
+            <action id="ReviewMarks.AttachHistory" class="dev.doreview.ide.ReattachReviewHistoryAction"
+                    text="Attach Review History…" description="Attach existing local review history to this file"/>
+            <action id="ReviewMarks.ToggleStripe" class="dev.doreview.ide.ToggleReviewStripeAction"
+                    text="Show DoReview Stripe" description="Show the review stripe in project editors"/>
+            <separator/>
+            <action id="ReviewMarks.ClearFile" class="dev.doreview.ide.ClearFileAction"
+                    text="Clear All Reviews in File" description="Revoke all reviews in the current file while retaining history"/>
+        </group>
+    </actions>
+</idea-plugin>

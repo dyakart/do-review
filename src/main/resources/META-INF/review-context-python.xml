@@ -1,0 +1,5 @@
+<idea-plugin>
+    <extensions defaultExtensionNs="dev.reviewmarks">
+        <contextProvider implementation="dev.doreview.ide.context.PythonContextProvider"/>
+    </extensions>
+</idea-plugin>

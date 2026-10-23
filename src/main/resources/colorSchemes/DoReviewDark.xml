@@ -1,0 +1,10 @@
+<list>
+    <option name="REVIEW_MARKS_REVIEWED">
+        <value>
+            <option name="BACKGROUND" value="28543a"/>
+        </value>
+    </option>
+    <option name="REVIEW_MARKS_NEEDS_REVIEW">
+        <value><option name="BACKGROUND" value="66551e"/></value>
+    </option>
+</list>
