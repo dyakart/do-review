@@ -1,6 +1,6 @@
 # DoReview
 
-Persistent, personal code review tracking for PyCharm.
+Personal code review tracking with persistent history.
 
 **Supported IDE:** PyCharm 2026.2 (IntelliJ Platform 262.*).
 
