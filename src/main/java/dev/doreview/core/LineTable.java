@@ -7,17 +7,23 @@ import java.util.List;
 /** Content rows own their LF; a trailing empty logical editor row has no offsets. */
 record LineTable(List<String> text, int[] starts) {
     static LineTable from(String value) {
+        return from(value, () -> { });
+    }
+
+    static LineTable from(String value, Runnable cancellationCheck) {
+        cancellationCheck.run();
         var lines = new ArrayList<String>();
         var starts = new ArrayList<Integer>();
         int start = 0;
         while (start < value.length()) {
+            if ((lines.size() & 255) == 0) cancellationCheck.run();
             int newline = value.indexOf('\n', start);
             int end = newline < 0 ? value.length() : newline + 1;
             starts.add(start);
             lines.add(value.substring(start, end));
             start = end;
         }
-        return new LineTable(lines, starts.stream().mapToInt(Integer::intValue).toArray());
+        return new LineTable(List.copyOf(lines), starts.stream().mapToInt(Integer::intValue).toArray());
     }
 
     int lineAt(int offset) {

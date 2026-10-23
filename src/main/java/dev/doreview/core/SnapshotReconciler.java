@@ -2,10 +2,8 @@ package dev.doreview.core;
 
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
-import java.util.Map;
 import java.util.Objects;
 
 /**
@@ -47,8 +45,8 @@ public final class SnapshotReconciler {
             return reviewed;
         }
 
-        var oldLines = Lines.from(previous);
-        var newLines = Lines.from(current);
+        var oldLines = LineTable.from(previous);
+        var newLines = LineTable.from(current);
         var mapping = map(previous, current);
 
         var result = new ArrayList<ReviewedRange>();
@@ -120,14 +118,21 @@ public final class SnapshotReconciler {
         Objects.requireNonNull(previous, "previous");
         Objects.requireNonNull(current, "current");
         Objects.requireNonNull(workBudget, "workBudget");
-        var oldLines = Lines.from(previous);
-        var newLines = Lines.from(current);
+        return map(SnapshotIndex.prepare(previous, cancellationCheck),
+                SnapshotIndex.prepare(current, cancellationCheck), workBudget, cancellationCheck);
+    }
+
+    static Mapping map(SnapshotIndex previous, SnapshotIndex current, ProjectionWorkBudget workBudget,
+            Runnable cancellationCheck) {
+        cancellationCheck.run();
+        var oldLines = previous.lines();
+        var newLines = current.lines();
         int[] mapping = new int[oldLines.text().size()];
         Arrays.fill(mapping, -1);
         var budget = new DiffBudget(workBudget, cancellationCheck);
         int oldGapStart = 0;
         int newGapStart = 0;
-        for (var anchor : mandatoryUniqueAnchors(oldLines.text(), newLines.text())) {
+        for (var anchor : mandatoryUniqueAnchors(previous, current)) {
             cancellationCheck.run();
             mapGap(oldLines.text(), newLines.text(), oldGapStart, anchor.oldLine(),
                     newGapStart, anchor.newLine(), mapping, budget);
@@ -172,15 +177,14 @@ public final class SnapshotReconciler {
     }
 
     /** Keeps only anchors present in every longest increasing anchor sequence. */
-    private static List<Anchor> mandatoryUniqueAnchors(List<String> oldLines, List<String> newLines) {
-        var oldOccurrences = occurrences(oldLines);
-        var newOccurrences = occurrences(newLines);
+    private static List<Anchor> mandatoryUniqueAnchors(SnapshotIndex previous, SnapshotIndex current) {
+        var oldLines = previous.lines().text();
         var candidates = new ArrayList<Anchor>();
         for (int oldLine = 0; oldLine < oldLines.size(); oldLine++) {
-            var oldOccurrence = oldOccurrences.get(oldLines.get(oldLine));
-            var newOccurrence = newOccurrences.get(oldLines.get(oldLine));
-            if (oldOccurrence.count == 1 && newOccurrence != null && newOccurrence.count == 1) {
-                candidates.add(new Anchor(oldLine, newOccurrence.index));
+            var oldOccurrence = previous.occurrence(oldLines.get(oldLine));
+            var newOccurrence = current.occurrence(oldLines.get(oldLine));
+            if (oldOccurrence.count() == 1 && newOccurrence != null && newOccurrence.count() == 1) {
+                candidates.add(new Anchor(oldLine, newOccurrence.index()));
             }
         }
         int size = candidates.size();
@@ -332,19 +336,6 @@ public final class SnapshotReconciler {
         return true;
     }
 
-    private static Map<String, Occurrence> occurrences(List<String> lines) {
-        var result = new HashMap<String, Occurrence>();
-        for (int i = 0; i < lines.size(); i++) {
-            var occurrence = result.get(lines.get(i));
-            if (occurrence == null) {
-                result.put(lines.get(i), new Occurrence(i));
-            } else {
-                occurrence.count++;
-            }
-        }
-        return result;
-    }
-
     private static int lowerBound(int[] sorted, int size, int value) {
         int low = 0;
         int high = size;
@@ -362,15 +353,6 @@ public final class SnapshotReconciler {
     private record Anchor(int oldLine, int newLine) {
     }
 
-    private static final class Occurrence {
-        private final int index;
-        private int count = 1;
-
-        private Occurrence(int index) {
-            this.index = index;
-        }
-    }
-
     private static final class DiffBudget {
         private final ProjectionWorkBudget workBudget;
         private final List<int[]> limited = new ArrayList<>();
@@ -382,24 +364,4 @@ public final class SnapshotReconciler {
         }
     }
 
-    private record Lines(List<String> text, int[] starts) {
-        private static Lines from(String value) {
-            var text = new ArrayList<String>();
-            var starts = new ArrayList<Integer>();
-            int start = 0;
-            while (start < value.length()) {
-                int newline = value.indexOf('\n', start);
-                int end = newline < 0 ? value.length() : newline + 1;
-                starts.add(start);
-                text.add(value.substring(start, end));
-                start = end;
-            }
-            return new Lines(text, starts.stream().mapToInt(Integer::intValue).toArray());
-        }
-
-        private int lineAt(int offset) {
-            int match = Arrays.binarySearch(starts, offset);
-            return match >= 0 ? match : -match - 2;
-        }
-    }
 }

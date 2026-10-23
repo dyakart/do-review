@@ -43,8 +43,7 @@ public final class ReviewHistoryEngine {
     public static ReviewHistory revoke(ReviewHistory history, List<EvidenceRef> refs) {
         if (refs.isEmpty()) return history;
         var grouped = new LinkedHashMap<String, List<ReviewedRange>>();
-        var byId = new HashMap<String, ReviewEvidence>();
-        history.evidence().forEach(proof -> byId.put(proof.id(), proof));
+        var byId = ReviewHistoryIndex.of(history, () -> { }).byId();
         for (var ref : refs) {
             var proof = byId.get(ref.evidenceId());
             if (proof == null || ref.baselineEnd() > history.snapshots().get(proof.snapshotId()).text().length()) {
@@ -75,14 +74,22 @@ public final class ReviewHistoryEngine {
             Map<String, ContextMap> baselineContexts, ContextMap currentContext, ProjectionHints hints,
             ProjectionWorkBudget workBudget, Runnable cancellationCheck) {
         Objects.requireNonNull(workBudget, "workBudget");
-        cancellationCheck.run();
-        var snapshot = FileSnapshot.create(current);
-        var currentLines = LineTable.from(snapshot.text());
+        return project(history, baselineContexts, currentContext, hints,
+                new ReviewProjectionWorkspace(current, workBudget, cancellationCheck));
+    }
+
+    /** Reuses only this operation's prepared text/mappings, including a following checkpoint. */
+    public static FileProjection project(ReviewHistory history, Map<String, ContextMap> baselineContexts,
+            ContextMap currentContext, ProjectionHints hints, ReviewProjectionWorkspace workspace) {
+        workspace.checkCanceled();
+        var cancellationCheck = workspace.cancellationCheck();
+        var snapshot = workspace.current();
+        var currentLines = workspace.currentIndex().lines();
         var context = currentContext == null ? ContextMap.fallback(snapshot.text()) : currentContext;
         var live = hints == null ? ProjectionHints.empty() : hints;
         var rowBuilders = new ArrayList<RowBuilder>();
         for (int i = 0; i < currentLines.text().size(); i++) rowBuilders.add(new RowBuilder());
-        var maps = new HashMap<String, SnapshotReconciler.Mapping>();
+        var fallbackContexts = new HashMap<String, ContextMap>();
         var unresolvedTexts = new HashMap<ReviewedRange, Set<String>>();
         var deletions = new LinkedHashMap<DeletionKey, LinkedHashSet<EvidenceRef>>();
         var changeGroups = new LinkedHashMap<Object, ChangeGroup>();
@@ -91,7 +98,8 @@ public final class ReviewHistoryEngine {
             var baseline = history.snapshots().get(proofRow.proof().snapshotId());
             var baselineContext = baselineContexts == null ? null : baselineContexts.get(baseline.id());
             if (baselineContext == null) {
-                baselineContext = baseline.id().equals(snapshot.id()) ? context : ContextMap.fallback(baseline.text());
+                baselineContext = baseline.id().equals(snapshot.id()) ? context :
+                        fallbackContexts.computeIfAbsent(baseline.id(), ignored -> ContextMap.fallback(baseline.text()));
             }
             boolean exactSnapshot = baseline.id().equals(snapshot.id());
             if (exactSnapshot) {
@@ -142,10 +150,7 @@ public final class ReviewHistoryEngine {
                 } else if (unresolved == null && !live.baselineTexts().containsKey(proofRow.ref())) {
                     // A cold checkpoint can retain a denial without retaining any coordinates.
                     // Text matching may locate a diagnostic, never recover that denied identity.
-                    var mapping = maps.computeIfAbsent(baseline.id(), ignored -> {
-                        cancellationCheck.run();
-                        return SnapshotReconciler.map(baseline.text(), snapshot.text(), workBudget, cancellationCheck);
-                    });
+                    var mapping = workspace.mapping(baseline);
                     int mapped = mapping.currentLine(proofRow.line());
                     if (mapped >= 0) {
                         addPossibleDiagnostic(rowBuilders, mapped, FileProjection.Status.NEEDS_REVIEW,
@@ -162,10 +167,7 @@ public final class ReviewHistoryEngine {
                 }
                 continue; // Known lost identity may never rematch a newly inserted copy.
             }
-            var mapping = maps.computeIfAbsent(baseline.id(), ignored -> {
-                cancellationCheck.run();
-                return SnapshotReconciler.map(baseline.text(), snapshot.text(), workBudget, cancellationCheck);
-            });
+            var mapping = workspace.mapping(baseline);
             int mapped = mapping.currentLine(proofRow.line());
             if (mapped >= 0) {
                 if (!authoritative) {
@@ -274,41 +276,12 @@ public final class ReviewHistoryEngine {
     }
 
     private static List<ProofRow> proofRows(ReviewHistory history, Runnable cancellationCheck) {
-        var tables = new HashMap<String, LineTable>();
-        var byProof = new HashMap<String, List<Revocation>>();
-        history.revocations().forEach(revocation -> byProof.computeIfAbsent(revocation.evidenceId(), ignored -> new ArrayList<>()).add(revocation));
-        var rows = new ArrayList<ProofRow>();
-        for (var proof : history.evidence()) {
-            cancellationCheck.run();
-            var lines = tables.computeIfAbsent(proof.snapshotId(), id -> LineTable.from(history.snapshots().get(id).text()));
-            var revokedRanges = ReviewRanges.normalized(byProof.getOrDefault(proof.id(), List.of()).stream()
-                    .flatMap(item -> item.ranges().stream()).toList());
-            for (var range : proof.ranges()) {
-                for (int line = lines.lineAt(range.start()); line <= lines.lineAt(range.end() - 1); line++) {
-                    if ((line & 255) == 0) cancellationCheck.run();
-                    // Old journals can contain blank rows; retain the journal, ignore those proofs.
-                    if (lines.text().get(line).isBlank()) continue;
-                    int start = Math.max(range.start(), lines.starts()[line]);
-                    int end = Math.min(range.end(), lines.end(line));
-                    var ref = new EvidenceRef(proof.id(), start, end);
-                    boolean revoked = overlaps(revokedRanges, start, end);
-                    if (!revoked) rows.add(new ProofRow(proof, ref, line, lines,
-                            start == lines.starts()[line] && end == lines.end(line)));
-                }
-            }
-        }
-        return rows;
+        return ReviewHistoryIndex.proofRows(history, cancellationCheck);
     }
 
-    private static boolean overlaps(List<ReviewedRange> ranges, int start, int end) {
-        int low = 0;
-        int high = ranges.size();
-        while (low < high) {
-            int middle = (low + high) >>> 1;
-            if (ranges.get(middle).end() <= start) low = middle + 1;
-            else high = middle;
-        }
-        return low < ranges.size() && ranges.get(low).start() < end;
+    /** Reviewed baselines in immutable recency order; checkpoint-only texts require no PSI analysis. */
+    public static List<FileSnapshot> snapshotsByRecency(ReviewHistory history, Runnable cancellationCheck) {
+        return ReviewHistoryIndex.of(history, cancellationCheck).snapshotsByRecency();
     }
 
     private static boolean covered(List<ReviewedRange> ranges, int start, int end) {

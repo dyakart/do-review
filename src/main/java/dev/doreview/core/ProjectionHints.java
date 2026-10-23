@@ -53,11 +53,14 @@ public record ProjectionHints(Map<EvidenceRef, ReviewedRange> livePositions,
         if (!FileSnapshot.normalize(current).equals(current)) {
             throw new IllegalArgumentException("Checkpoint text must use normalized LF offsets");
         }
-        var lines = LineTable.from(current);
-        var occurrences = new HashMap<String, Integer>();
-        for (var line : lines.text()) occurrences.merge(line, 1, Integer::sum);
+        return compactForCheckpoint(current, SnapshotIndex.prepare(current, () -> { }), () -> { });
+    }
+
+    private ProjectionHints compactForCheckpoint(String current, SnapshotIndex currentIndex, Runnable cancellationCheck) {
         var retained = new LinkedHashSet<EvidenceRef>();
+        int processed = 0;
         for (var ref : authoritativeRefs) {
+            if ((processed++ & 255) == 0) cancellationCheck.run();
             var position = livePositions.get(ref);
             String baseline = baselineTexts.get(ref);
             boolean fullRow = position != null && position.end() <= current.length()
@@ -65,7 +68,7 @@ public record ProjectionHints(Map<EvidenceRef, ReviewedRange> livePositions,
                     && (position.end() == current.length() || current.charAt(position.end() - 1) == '\n');
             boolean exactUnique = fullRow && baseline != null && position.end() - position.start() == baseline.length()
                     && current.regionMatches(position.start(), baseline, 0, baseline.length())
-                    && occurrences.getOrDefault(baseline, 0) == 1;
+                    && currentIndex.count(baseline) == 1;
             if (!exactUnique || deletedRefs.contains(ref) || unresolvedPositions.containsKey(ref)) retained.add(ref);
         }
         return retainOnly(retained);
@@ -88,16 +91,23 @@ public record ProjectionHints(Map<EvidenceRef, ReviewedRange> livePositions,
     public ProjectionHints compactForCheckpoint(String current, ReviewHistory history,
             ProjectionWorkBudget workBudget, Runnable cancellationCheck) {
         Objects.requireNonNull(workBudget, "workBudget");
-        var conservative = compactForCheckpoint(current);
-        var currentLines = LineTable.from(current);
-        var currentCounts = occurrences(currentLines);
-        var byId = new HashMap<String, ReviewEvidence>();
-        history.evidence().forEach(proof -> byId.put(proof.id(), proof));
-        var baselineLines = new HashMap<String, LineTable>();
-        var baselineCounts = new HashMap<String, Map<String, Integer>>();
-        var mappings = new HashMap<String, SnapshotReconciler.Mapping>();
+        if (!FileSnapshot.normalize(current).equals(current)) {
+            throw new IllegalArgumentException("Checkpoint text must use normalized LF offsets");
+        }
+        return compactForCheckpoint(history, new ReviewProjectionWorkspace(current, workBudget, cancellationCheck));
+    }
+
+    /** Uses the same current preparation and mapping allowance as the preceding projection. */
+    public ProjectionHints compactForCheckpoint(ReviewHistory history, ReviewProjectionWorkspace workspace) {
+        workspace.checkCanceled();
+        var cancellationCheck = workspace.cancellationCheck();
+        String current = workspace.current().text();
+        var currentIndex = workspace.currentIndex();
+        var conservative = compactForCheckpoint(current, currentIndex, cancellationCheck);
+        var currentLines = currentIndex.lines();
+        var byId = ReviewHistoryIndex.of(history, cancellationCheck).byId();
         var retained = new LinkedHashSet<>(conservative.authoritativeRefs);
-        String currentId = FileSnapshot.create(current).id();
+        String currentId = workspace.current().id();
         int processed = 0;
         for (var ref : conservative.authoritativeRefs) {
             if ((processed++ & 255) == 0) cancellationCheck.run();
@@ -107,7 +117,8 @@ public record ProjectionHints(Map<EvidenceRef, ReviewedRange> livePositions,
                     || conservative.unresolvedPositions.containsKey(ref)) continue;
             var baseline = history.snapshots().get(proof.snapshotId());
             if (baseline == null || ref.baselineEnd() > baseline.text().length()) continue;
-            var lines = baselineLines.computeIfAbsent(baseline.id(), ignored -> LineTable.from(baseline.text()));
+            var baselineIndex = SnapshotIndex.of(baseline, cancellationCheck);
+            var lines = baselineIndex.lines();
             int line = lines.lineAt(ref.baselineStart());
             if (line < 0 || ref.baselineStart() != lines.starts()[line] || ref.baselineEnd() != lines.end(line)) continue;
             String source = lines.text().get(line);
@@ -117,22 +128,14 @@ public record ProjectionHints(Map<EvidenceRef, ReviewedRange> livePositions,
                 retained.remove(ref); // Whole-snapshot restoration already fixes original row positions.
                 continue;
             }
-            var counts = baselineCounts.computeIfAbsent(baseline.id(), ignored -> occurrences(lines));
-            if (currentCounts.getOrDefault(source, 0) > counts.getOrDefault(source, 0)) continue;
-            var mapping = mappings.computeIfAbsent(baseline.id(), ignored ->
-                    SnapshotReconciler.map(baseline.text(), current, workBudget, cancellationCheck));
+            if (currentIndex.count(source) > baselineIndex.count(source)) continue;
+            var mapping = workspace.mapping(baseline);
             int target = mapping.currentLine(line);
             if (target >= 0 && position.start() == currentLines.starts()[target] && position.end() == currentLines.end(target)) {
                 retained.remove(ref);
             }
         }
         return conservative.retainOnly(retained);
-    }
-
-    private static Map<String, Integer> occurrences(LineTable lines) {
-        var counts = new HashMap<String, Integer>();
-        for (String text : lines.text()) counts.merge(text, 1, Integer::sum);
-        return counts;
     }
 
     private ProjectionHints retainOnly(Set<EvidenceRef> retained) {
@@ -156,8 +159,7 @@ public record ProjectionHints(Map<EvidenceRef, ReviewedRange> livePositions,
         var positions = new LinkedHashMap<EvidenceRef, ReviewedRange>();
         var authoritative = new LinkedHashSet<EvidenceRef>();
         var duplicate = new HashSet<EvidenceRef>();
-        var byId = new HashMap<String, ReviewEvidence>();
-        history.evidence().forEach(proof -> byId.put(proof.id(), proof));
+        var byId = ReviewHistoryIndex.of(history, () -> { }).byId();
         var baselineTexts = new HashMap<EvidenceRef, String>();
         var canonicalGroups = new IdentityHashMap<FileProjection.PossibleEvidence, FileProjection.PossibleEvidence>();
         var groupsByValue = new HashMap<FileProjection.PossibleEvidence, FileProjection.PossibleEvidence>();
@@ -203,8 +205,9 @@ public record ProjectionHints(Map<EvidenceRef, ReviewedRange> livePositions,
             for (var ref : deletion.evidenceRefs()) {
                 var proof = byId.get(ref.evidenceId());
                 if (proof == null) continue;
-                String text = history.snapshots().get(proof.snapshotId()).text();
-                var lines = tables.computeIfAbsent(proof.snapshotId(), ignored -> LineTable.from(text));
+                var snapshot = history.snapshots().get(proof.snapshotId());
+                String text = snapshot.text();
+                var lines = tables.computeIfAbsent(proof.snapshotId(), ignored -> SnapshotIndex.of(snapshot, () -> { }).lines());
                 int row = lines.lineAt(ref.baselineStart());
                 int gapStart = Math.max(0, row - deletion.ordinal());
                 String source = text.substring(ref.baselineStart(), ref.baselineEnd());

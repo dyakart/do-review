@@ -10,11 +10,9 @@ import dev.doreview.core.ProjectionHints;
 import dev.doreview.core.ProjectionWorkBudget;
 import dev.doreview.core.ReviewHistory;
 import dev.doreview.core.ReviewHistoryEngine;
+import dev.doreview.core.ReviewProjectionWorkspace;
 import dev.doreview.ide.context.ContextAnalysisManager;
 
-import java.util.ArrayList;
-import java.util.Comparator;
-import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -41,11 +39,7 @@ public final class ReviewProjectionComputer {
         ContextMap current = text.length() <= limits.snapshotCharacters && text.length() <= limits.totalCharacters
                 ? manager.analyzeUnderRead(file, text) : limited();
         long consumed = text.length() <= limits.snapshotCharacters && text.length() <= limits.totalCharacters ? text.length() : 0;
-        var sequences = new HashMap<String, Long>();
-        history.evidence().forEach(proof -> sequences.merge(proof.snapshotId(), proof.sequence(), Math::max));
-        var snapshots = new ArrayList<>(history.snapshots().values());
-        snapshots.sort(Comparator.<dev.doreview.core.FileSnapshot>comparingLong(snapshot -> sequences.getOrDefault(snapshot.id(), 0L))
-                .reversed().thenComparing(dev.doreview.core.FileSnapshot::id));
+        var snapshots = ReviewHistoryEngine.snapshotsByRecency(history, ProgressManager::checkCanceled);
         var contexts = new LinkedHashMap<String, ContextMap>();
         int historical = 0;
         for (var snapshot : snapshots) {
@@ -70,12 +64,12 @@ public final class ReviewProjectionComputer {
     public Result computeResult(ReviewHistory history, String text, ProjectionHints hints, CapturedContexts contexts) {
         requirePurePhase();
         var budget = ProjectionWorkBudget.defaults();
-        var projection = ReviewHistoryEngine.project(history, text, contexts.baselines(), contexts.current(), hints,
-                budget, ProgressManager::checkCanceled);
+        var workspace = new ReviewProjectionWorkspace(text, budget, ProgressManager::checkCanceled);
+        var projection = ReviewHistoryEngine.project(history, contexts.baselines(), contexts.current(), hints, workspace);
         ProgressManager.checkCanceled();
         var resolved = hints.mergeResolved(ProjectionHints.fromProjection(history, projection));
         ProgressManager.checkCanceled();
-        var checkpoint = resolved.compactForCheckpoint(text, history, budget, ProgressManager::checkCanceled);
+        var checkpoint = resolved.compactForCheckpoint(history, workspace);
         return new Result(projection, resolved, checkpoint);
     }
 
