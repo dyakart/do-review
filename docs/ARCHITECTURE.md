@@ -13,7 +13,7 @@ DoReview targets PyCharm 2026.2 (platform 262). It shares review evidence throug
 | `ReviewHistoryStore`, `SharedReviewHistoryStore`, `LegacyReviewHistoryModel` | Facade, serial persistence coordinator and legacy compatibility model. |
 | `SharedHistoryRepository`, `ReviewRepositoryPaths` | Portable events, SQLite storage, checkout reconciliation and filesystem identity. |
 | `ReviewEditorPresentation`, stripe classes | Editor resources and rendering from immutable `FileProjection` values. |
-| `ReviewHistoryActions` | Version comparison, authors and explicit history attachment. |
+| `ReviewHistoryActions`, `ReviewGitHistory` | Version comparison, exact Git content labels, authors and explicit history attachment. |
 
 ## Review model
 
@@ -46,6 +46,12 @@ Existing XML history is imported in the background as **Imported history**, pres
 **Rebuild Review Index** first publishes pending work for the active checkout, refuses to discard retained work from other checkouts or missing causal parents, and creates a consistent `history-before-rebuild-*.sqlite3` backup beside the database. It then reconstructs derived tables from `.doreview`. Missing or corrupted shared artifacts must be restored from Git first; rebuilding cannot repair the portable source. Unsupported formats are preserved without being overwritten. Successful legacy migration is recorded per project so future starts do not deserialize the global XML archive again.
 
 Preserve plugin ID `dev.reviewmarks`, action IDs `ReviewMarks.*`, widget ID `ReviewMarks.Coverage`, extension point `dev.reviewmarks.contextProvider` and color keys `REVIEW_MARKS_REVIEWED` / `REVIEW_MARKS_NEEDS_REVIEW`. Stripe visibility remains separate project state in `workspace.xml`, defaulting to false.
+
+## Version comparison
+
+Reviewed snapshots remain the authoritative comparison baseline. The chooser can label a snapshot with a Git source commit's hash and subject only after its full file content matches the snapshot's SHA-256 after LF normalization. Review date and reviewer are displayed separately; a matching source commit does not identify when the review was created or imply that the entire commit was reviewed.
+
+Git lookup runs off EDT with bounded history, output and execution time. It follows the current checkout's file history, including renames, and performs no Git writes. Versions without a match retain an explicit **DoReview snapshot** label; no match does not establish that the text was never committed. Imported, unsaved and non-Git snapshots remain available without changing the history schema, and snapshot text is loaded only when selected for comparison.
 
 ## Language context
 

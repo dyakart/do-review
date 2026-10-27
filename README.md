@@ -24,6 +24,8 @@ Green marks indicate reviewed text with matching context. Yellow marks require r
 
 The **DoReview** menu provides version comparison, history management and **Show DoReview Stripe**. Stripe visibility is saved per project and is off by default.
 
+Version comparison always opens the saved reviewed snapshot. A matching Git commit's hash and subject identify versions whose full file text matches after line-ending normalization; review dates and reviewers remain separate. Other versions are labelled **DoReview snapshot**, including imported or unsaved text without a matching Git revision.
+
 The stripe fills blank and whitespace-only rows with green because they need no review. Hovering shows `DoReview — blank line, no review required`. This fill applies only to the stripe; blank rows remain excluded from editor highlighting, review history and coverage. Unreviewed code takes priority over blank fill when rows share a minimap pixel.
 
 Python, Tact and Tolk use their language plugins for structural context. Other languages use a conservative whole-file fingerprint. Marks track text and syntax context; they do not establish program correctness.
