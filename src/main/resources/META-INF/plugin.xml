@@ -1,7 +1,7 @@
 <idea-plugin require-restart="true">
     <id>dev.reviewmarks</id>
     <name>DoReview</name>
-    <version>0.3.0</version>
+    <version>0.3.1</version>
     <vendor>Artem Dyakovich</vendor>
     <description><![CDATA[
         <p><b>DoReview</b> — by Artem Dyakovich</p>

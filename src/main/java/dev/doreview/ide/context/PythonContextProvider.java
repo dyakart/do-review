@@ -12,16 +12,17 @@ import java.util.Set;
 /** PythonCore syntax adapter; no TypeEvalContext, resolution, imports or dataflow. */
 public final class PythonContextProvider extends StructuredPsiContextProvider {
     private static final Set<String> GUARD_CALLS = Set.of("require", "throwIf", "throwUnless");
-    @Override public String id() { return "python:" + version("PythonCore", "262") + ":structure-v3"; }
+    @Override public String id() { return "python:" + version("PythonCore", "262") + ":structure-v4"; }
     @Override public boolean supports(PsiFile file) { return file instanceof PyFile; }
 
     @Override protected void collect(PsiElement element, List<Scope> scopes) {
         if (element instanceof PyStatementList node) {
             PyStatement[] statements = node.getStatements();
             int end = statements.length == 0 ? 0 : statements[statements.length - 1].getTextRange().getEndOffset();
-            for (PyStatement statement : statements) {
+            for (int index = 0; index + 1 < statements.length; index++) {
+                PyStatement statement = statements[index];
                 if (containsGate(statement, PythonContextProvider::isGate, PythonContextProvider::isDeclaration)) {
-                    followingGuard(scopes, node, statement, end,
+                    followingGuard(scopes, node, statement, statements[index + 1], end,
                             literalPayloads(statement, PythonContextProvider::gatePayloads, PythonContextProvider::isDeclaration));
                 }
             }

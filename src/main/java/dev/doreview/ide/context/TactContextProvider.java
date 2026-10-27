@@ -14,7 +14,7 @@ import java.util.Set;
 public final class TactContextProvider extends StructuredPsiContextProvider {
     private static final Set<String> GUARD_CALLS = Set.of("require", "assert", "throw", "throwIf", "throwUnless",
             "nativeThrow", "nativeThrowIf", "nativeThrowUnless");
-    @Override public String id() { return "tact:" + version("org.tonstudio.tact", "0.1.2") + ":structure-v3"; }
+    @Override public String id() { return "tact:" + version("org.tonstudio.tact", "0.1.2") + ":structure-v4"; }
     @Override public boolean supports(PsiFile file) { return file instanceof TactFile; }
 
     @Override protected PreparedPsi prepare(PsiFile file, String text) {
@@ -41,9 +41,10 @@ public final class TactContextProvider extends StructuredPsiContextProvider {
         if (element instanceof TactBlock node) {
             List<TactStatement> statements = node.getStatementList();
             int end = statements.isEmpty() ? 0 : statements.getLast().getTextRange().getEndOffset();
-            for (TactStatement statement : statements) {
+            for (int index = 0; index + 1 < statements.size(); index++) {
+                TactStatement statement = statements.get(index);
                 if (containsGate(statement, TactContextProvider::isGate, TactContextProvider::isDeclaration)) {
-                    followingGuard(scopes, node, statement, end,
+                    followingGuard(scopes, node, statement, statements.get(index + 1), end,
                             literalPayloads(statement, TactContextProvider::gatePayloads, TactContextProvider::isDeclaration));
                 }
             }

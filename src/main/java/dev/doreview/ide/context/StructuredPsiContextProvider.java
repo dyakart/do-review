@@ -171,9 +171,13 @@ abstract class StructuredPsiContextProvider implements ContextProvider {
     }
 
     /** Explicit syntactic gates affect following rows, never preceding rows or other blocks. */
-    protected static void followingGuard(List<Scope> scopes, PsiElement block, PsiElement statement, int end,
+    protected static void followingGuard(List<Scope> scopes, PsiElement block, PsiElement statement,
+                                         PsiElement nextStatement, int end,
                                          List<TextRange> literalPayloads) {
-        int start = statement.getTextRange().getEndOffset();
+        // The guard's end may share its physical row with its own closing delimiter.
+        // Start at actual following code: same-row statements retain the dependency,
+        // while a guard cannot gain or lose context when a later statement is removed.
+        int start = nextStatement.getTextRange().getStartOffset();
         if (start >= end) return;
         TextRange header = statement.getTextRange();
         String signature = "preceding-syntactic-guard:" + tokens(block.getContainingFile(), header, literalPayloads);

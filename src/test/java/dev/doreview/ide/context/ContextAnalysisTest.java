@@ -11,7 +11,7 @@ public final class ContextAnalysisTest extends BasePlatformTestCase {
         String source = "fun sample(x: Int): Int {\n    if (x > 0) {\n        return x;\n    }\n    return 0;\n}\n";
         VirtualFile file = open("sample.tact", source);
         ContextMap baseline = analyze(file, source);
-        assertEquals("tact:0.1.2:structure-v3", baseline.provider());
+        assertEquals("tact:0.1.2:structure-v4", baseline.provider());
         assertNotNull(baseline.fingerprints().get(2));
         assertDiffers(baseline, analyze(file, source.replace("x > 0", "x > 1")), 2);
         assertDiffers(baseline, analyze(file, source.replace("x > 0", "x > 1")), 4);
@@ -24,7 +24,7 @@ public final class ContextAnalysisTest extends BasePlatformTestCase {
         String source = "fun sample(x: int): int {\n    if (x > 0) {\n        return x;\n    }\n    return 0;\n}\n";
         VirtualFile file = open("sample.tolk", source);
         ContextMap baseline = analyze(file, source);
-        assertEquals("tolk:4.1.0:structure-v3", baseline.provider());
+        assertEquals("tolk:4.1.0:structure-v4", baseline.provider());
         assertNotNull(baseline.fingerprints().get(2));
         assertDiffers(baseline, analyze(file, source.replace("x > 0", "x > 1")), 2);
         assertDiffers(baseline, analyze(file, source.replace("x > 0", "x > 1")), 4);

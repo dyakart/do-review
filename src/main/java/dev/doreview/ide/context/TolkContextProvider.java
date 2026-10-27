@@ -13,7 +13,7 @@ import java.util.Set;
 public final class TolkContextProvider extends StructuredPsiContextProvider {
     private static final Set<String> GUARD_CALLS = Set.of("require", "throwIf", "throwUnless", "nativeThrow",
             "nativeThrowIf", "nativeThrowUnless");
-    @Override public String id() { return "tolk:" + version("org.ton.intellij-ton", "4.1.0") + ":structure-v3"; }
+    @Override public String id() { return "tolk:" + version("org.ton.intellij-ton", "4.1.0") + ":structure-v4"; }
     @Override public boolean supports(PsiFile file) { return file instanceof TolkFile; }
 
     @Override protected TextRange recoveryBoundary(PsiElement element) {
@@ -61,9 +61,10 @@ public final class TolkContextProvider extends StructuredPsiContextProvider {
         } else if (element instanceof TolkBlockStatement node) {
             List<TolkStatement> statements = node.getStatementList();
             int end = statements.isEmpty() ? 0 : statements.getLast().getTextRange().getEndOffset();
-            for (TolkStatement statement : statements) {
+            for (int index = 0; index + 1 < statements.size(); index++) {
+                TolkStatement statement = statements.get(index);
                 if (containsGate(statement, TolkContextProvider::isGate, TolkContextProvider::isDeclaration)) {
-                    followingGuard(scopes, node, statement, end,
+                    followingGuard(scopes, node, statement, statements.get(index + 1), end,
                             literalPayloads(statement, TolkContextProvider::gatePayloads, TolkContextProvider::isDeclaration));
                 }
             }
