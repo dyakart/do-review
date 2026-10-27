@@ -141,6 +141,51 @@ public final class ReviewStripeCodeGlanceTest extends FileEditorManagerTestCase 
         assertNative(editor, centerSpan(editor, glance(editor)));
     }
 
+    public void testBlankRowsMatchNativeMarkers() { assertBlankRows(false); }
+
+    public void testBlankRowsMatchNativeFastMarkers() { assertBlankRows(true); }
+
+    private void assertBlankRows(boolean fast) {
+        config.setUseFastMinimapForMain(fast);
+        var editor = open("blank.py");
+        var document = editor.getDocument();
+        WriteCommandAction.runWriteCommandAction(getProject(), () -> document.replaceString(
+                document.getLineStartOffset(100), document.getLineStartOffset(900), " \t\n".repeat(800)));
+        fresh(editor);
+        var stripe = stripe(editor);
+        var shared = stripe.currentSnapshot();
+        assertTrue(shared.runs().stream().anyMatch(run -> run.kind() == ReviewStripeModel.Kind.BLANK));
+        var markup = DocumentMarkupModel.forDocument(document, getProject(), true);
+        for (var mode : List.of(EditorSizeEnum.Proportional, EditorSizeEnum.Fit)) {
+            config.setEditorSize(mode);
+            sizeHost(editor, 880, 350);
+            scroll(editor, 400);
+            var glance = glance(editor);
+            for (double scale : new double[]{1.0, 1.5, 2.0}) {
+                glance.getScaleContext().overrideScale(new Scale(1.0, ScaleType.USR_SCALE));
+                glance.getScaleContext().overrideScale(new Scale(1.0, ScaleType.SYS_SCALE));
+                glance.getScaleContext().overrideScale(new Scale(scale, ScaleType.OBJ_SCALE));
+                glance.updateScrollState(editor.getScrollingModel().getVisibleArea(), false);
+                var span = centerSpan(editor, glance);
+                assertTrue(span.start >= document.getLineStartOffset(100));
+                assertTrue(span.end <= document.getLineStartOffset(900));
+                var gitMarker = markup.addRangeHighlighter(span.start, span.end - 1,
+                        HighlighterLayer.ADDITIONAL_SYNTAX, new TextAttributes(), HighlighterTargetArea.EXACT_RANGE);
+                gitMarker.setThinErrorStripeMark(true);
+                gitMarker.setErrorStripeMarkColor(Color.MAGENTA);
+                try {
+                    var gitBefore = nativeVcsRows(glance, stripe);
+                    assertNative(editor, span, ReviewStripeModel.Kind.BLANK);
+                    stripe.setSnapshot(shared);
+                    assertEquals("Drawing blank fill must preserve native Git marker pixels",
+                            Arrays.toString(gitBefore), Arrays.toString(nativeVcsRows(glance, stripe)));
+                    assertTrue(gitMarker.isValid());
+                    assertEquals(Color.MAGENTA, gitMarker.getErrorStripeMarkColor(editor.getColorsScheme()));
+                } finally { markup.removeHighlighter(gitMarker); }
+            }
+        }
+    }
+
     public void testNativeInlay() {
         config.setEditorSize(EditorSizeEnum.Fit);
         var editor = open("inlay.py");
@@ -293,6 +338,10 @@ public final class ReviewStripeCodeGlanceTest extends FileEditorManagerTestCase 
 
     /** Compare actual painted rows, including CodeGlance's integer rectangles and fractional DPI transform. */
     private boolean[] assertNative(Editor editor, Span span) {
+        return assertNative(editor, span, ReviewStripeModel.Kind.REVIEWED);
+    }
+
+    private boolean[] assertNative(Editor editor, Span span, ReviewStripeModel.Kind kind) {
         var stripe = stripe(editor);
         var glance = glance(editor);
         glance.updateScrollState(editor.getScrollingModel().getVisibleArea(), false);
@@ -300,7 +349,7 @@ public final class ReviewStripeCodeGlanceTest extends FileEditorManagerTestCase 
         assertEquals("Review and minimap must start at the same component y", origin.y, stripe.trackBounds().y);
         assertEquals(glance.getHeight(), stripe.trackBounds().height);
         var snapshot = new ReviewStripeModel.Snapshot(editor.getDocument().getModificationStamp(), List.of(
-                new ReviewStripeModel.Run(span.start, span.end, ReviewStripeModel.Kind.REVIEWED)));
+                new ReviewStripeModel.Run(span.start, span.end, kind)));
         stripe.setSnapshot(snapshot);
 
         var markup = DocumentMarkupModel.forDocument(editor.getDocument(), getProject(), true);
@@ -310,15 +359,7 @@ public final class ReviewStripeCodeGlanceTest extends FileEditorManagerTestCase 
         marker.setErrorStripeMarkColor(Color.MAGENTA);
         boolean[] expected;
         try {
-            var image = new BufferedImage(64, stripe.getHeight(), BufferedImage.TYPE_INT_ARGB);
-            var graphics = image.createGraphics();
-            try {
-                graphics.translate(0, origin.y);
-                graphics.scale(glance.getPixScale(), glance.getPixScale());
-                // This is the exact method called by native MyVcsPanel.paintComponent.
-                glance.paintVcs(graphics, glance.getVisibleRangeOffset(), 8);
-            } finally { graphics.dispose(); }
-            expected = alphaRows(image, 2);
+            expected = nativeVcsRows(glance, stripe);
         } finally { markup.removeHighlighter(marker); }
 
         assertTrue("Native CodeGlance VCS oracle must actually paint the test range", first(expected) >= 0);
@@ -326,6 +367,19 @@ public final class ReviewStripeCodeGlanceTest extends FileEditorManagerTestCase 
         assertEquals("Review stripe must occupy precisely the native VCS marker rows. Native " + bounds(expected)
                         + ", review " + bounds(actual), Arrays.toString(expected), Arrays.toString(actual));
         return expected;
+    }
+
+    private static boolean[] nativeVcsRows(GlancePanel glance, ReviewStripePanel stripe) {
+        var origin = SwingUtilities.convertPoint(glance, 0, 0, stripe);
+        var image = new BufferedImage(64, stripe.getHeight(), BufferedImage.TYPE_INT_ARGB);
+        var graphics = image.createGraphics();
+        try {
+            graphics.translate(0, origin.y);
+            graphics.scale(glance.getPixScale(), glance.getPixScale());
+            // This is the exact method called by native MyVcsPanel.paintComponent.
+            glance.paintVcs(graphics, glance.getVisibleRangeOffset(), 8);
+        } finally { graphics.dispose(); }
+        return alphaRows(image, 2);
     }
 
     private static boolean[] stripeRows(ReviewStripePanel stripe) {
@@ -385,9 +439,15 @@ public final class ReviewStripeCodeGlanceTest extends FileEditorManagerTestCase 
                         && textEditors(file).stream().allMatch(TextEditor::isEditorLoaded), 10);
         editor.getSettings().setUseSoftWraps(false);
         editor.getScrollingModel().disableAnimation();
+        fresh(editor);
+        return editor;
+    }
+
+    private void fresh(Editor editor) {
         PlatformTestUtil.waitWithEventsDispatching("Review projection did not become current",
                 () -> service.isProjectionReady(editor.getDocument()), 10);
-        return editor;
+        PlatformTestUtil.waitWithEventsDispatching("Review stripe snapshot did not become current",
+                () -> stripe(editor).currentSnapshot() != null, 10);
     }
 
     private List<TextEditor> textEditors(VirtualFile file) {

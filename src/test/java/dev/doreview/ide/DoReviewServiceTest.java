@@ -355,7 +355,7 @@ public final class DoReviewServiceTest extends BasePlatformTestCase {
         assertSame(stripe, stripe(myFixture.getEditor()));
         assertNotNull(stripe.currentSnapshot());
         assertEquals(doc.getModificationStamp(), stripe.currentSnapshot().stamp());
-        assertEquals(ReviewStripeModel.capture(service.projection(doc), doc.getModificationStamp()), stripe.currentSnapshot());
+        assertEquals(ReviewStripeModel.capture(service.projection(doc), doc.getImmutableCharSequence(), doc.getModificationStamp()), stripe.currentSnapshot());
         assertTrue("Unchanged reviewed rows remain visible after pull",
                 stripe.bands().stream().anyMatch(band -> band.kind() == ReviewStripeModel.Kind.REVIEWED));
         assertTrue("The actual pulled row must appear with the changed marker",
@@ -415,7 +415,9 @@ public final class DoReviewServiceTest extends BasePlatformTestCase {
         myFixture.testAction(action); fresh(doc);
         assertTrue(stripe.bands().stream().anyMatch(band -> band.kind() == ReviewStripeModel.Kind.REVIEWED));
         myFixture.testAction(action); fresh(doc);
-        assertEmpty("Repeating Ctrl+M clears all review markers for the selected row", stripe.bands());
+        assertTrue("Repeating Ctrl+M clears all review markers while preserving blank decoration",
+                stripe.bands().stream().allMatch(band -> band.kind() == ReviewStripeModel.Kind.BLANK
+                        || band.kind() == ReviewStripeModel.Kind.UNREVIEWED));
     }
 
     public void testPullRestoresText() throws Exception {
@@ -582,6 +584,14 @@ public final class DoReviewServiceTest extends BasePlatformTestCase {
     }
     private void fresh(Document doc) {
         PlatformTestUtil.waitWithEventsDispatching("Current review projection did not finish", () -> service.isProjectionReady(doc), 10); flush();
+        if (ReviewStripeSettings.getInstance(getProject()).isShown()) {
+            PlatformTestUtil.waitWithEventsDispatching("Current stripe snapshot did not finish",
+                    () -> Arrays.stream(EditorFactory.getInstance().getEditors(doc, getProject()))
+                            .filter(editor -> ReviewStripeHost.find(editor) != null)
+                            .allMatch(editor -> Arrays.stream(ReviewStripeHost.find(editor).getComponents())
+                                    .filter(ReviewStripePanel.class::isInstance).map(ReviewStripePanel.class::cast)
+                                    .anyMatch(panel -> panel.currentSnapshot() != null)), 10);
+        }
     }
     private boolean green(Document doc, int line) {
         return service.getRanges(doc).stream().anyMatch(range -> range.start() <= doc.getLineStartOffset(line) && range.end() >= doc.getLineEndOffset(line));
@@ -651,7 +661,7 @@ public final class DoReviewServiceTest extends BasePlatformTestCase {
             }
             assertSame(editor.getDocument(), stripeTestHost.getEditor().getDocument());
             host = stripeTestHost;
-            flush();
+            fresh(editor.getDocument());
         }
         assertNotNull("A real main editor must have its outer stripe host", host);
         var panels = Arrays.stream(host.getComponents()).filter(ReviewStripePanel.class::isInstance)

@@ -175,7 +175,8 @@ final class ReviewStripePanel extends JPanel implements Disposable, UiDataProvid
     private Color color(ReviewStripeModel.Kind kind) {
         var scheme = editor.getColorsScheme();
         return switch (kind) {
-            case REVIEWED -> ReviewHighlighting.attributesFor(scheme).getBackgroundColor();
+            case BLANK, REVIEWED -> ReviewHighlighting.attributesFor(scheme).getBackgroundColor();
+            case UNREVIEWED -> scheme.getDefaultBackground();
             case NEEDS_REVIEW -> ReviewHighlighting.needsReviewAttributesFor(scheme).getBackgroundColor();
             case CHANGED -> fallback(scheme.getColor(EditorColors.MODIFIED_LINES_COLOR), JBColor.BLUE);
             case DELETED -> fallback(scheme.getColor(EditorColors.DELETED_LINES_COLOR), JBColor.RED);
@@ -190,6 +191,8 @@ final class ReviewStripePanel extends JPanel implements Disposable, UiDataProvid
         var mapping = mapping();
         int y = (int) Math.floor((event.getY() - mapping.top()) / mapping.scale());
         for (var band : ReviewStripeModel.bands(editor, current, mapping)) if (y >= band.y() && y < band.y() + band.height()) return switch (band.kind()) {
+            case BLANK -> "DoReview — blank line, no review required";
+            case UNREVIEWED -> "DoReview — no review mark";
             case REVIEWED -> "DoReview — reviewed";
             case NEEDS_REVIEW -> "DoReview — needs review";
             case CHANGED -> "DoReview — changed since review";

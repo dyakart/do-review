@@ -3,6 +3,7 @@ package dev.doreview.ide;
 import com.intellij.openapi.editor.Editor;
 import com.intellij.openapi.editor.VisualPosition;
 import com.intellij.openapi.editor.impl.EditorImpl;
+import com.intellij.openapi.progress.ProgressManager;
 import dev.doreview.core.FileProjection;
 import dev.doreview.core.ReviewedRange;
 
@@ -14,7 +15,7 @@ import java.util.Objects;
 /** Immutable review spans rasterized in minimap coordinates. */
 final class ReviewStripeModel {
     /** Later values win when several logical markers share a pixel (for example inside a fold). */
-    enum Kind { REVIEWED, NEEDS_REVIEW, CHANGED, DELETED }
+    enum Kind { BLANK, UNREVIEWED, REVIEWED, NEEDS_REVIEW, CHANGED, DELETED }
 
     record Snapshot(long stamp, List<Run> runs) {
         Snapshot { runs = List.copyOf(runs); }
@@ -48,8 +49,28 @@ final class ReviewStripeModel {
 
     private ReviewStripeModel() { }
 
-    static Snapshot capture(FileProjection projection, long stamp) {
+    static Snapshot capture(FileProjection projection, CharSequence immutableText, long stamp) {
+        Objects.requireNonNull(immutableText, "immutableText");
         var runs = new ArrayList<Run>();
+        int start = 0, line = 0, nextCancellation = 0;
+        boolean blank = true;
+        for (int at = 0; at < immutableText.length(); ) {
+            if (at >= nextCancellation) {
+                ProgressManager.checkCanceled();
+                nextCancellation = at + 4096;
+            }
+            int character = Character.codePointAt(immutableText, at);
+            int next = at + Character.charCount(character);
+            if (character == '\n') {
+                appendFill(runs, projection, line++, start, next, blank);
+                start = next;
+                blank = true;
+            } else if (!Character.isWhitespace(character)) blank = false;
+            at = next;
+        }
+        // The editor retains an empty final row after LF, including in an empty document.
+        appendFill(runs, projection, line, start, immutableText.length(), blank);
+        ProgressManager.checkCanceled();
         append(runs, projection.reviewedRanges(), Kind.REVIEWED);
         append(runs, projection.yellowRanges(), Kind.NEEDS_REVIEW);
         append(runs, projection.changedRanges(), Kind.CHANGED);
@@ -57,6 +78,22 @@ final class ReviewStripeModel {
                 .forEach(offset -> runs.add(new Run(offset, offset, Kind.DELETED)));
         runs.sort(Comparator.comparingInt(Run::start).thenComparingInt(Run::end).thenComparing(Run::kind));
         return new Snapshot(stamp, runs);
+    }
+
+    private static void appendFill(List<Run> result, FileProjection projection, int line,
+                                   int start, int end, boolean blank) {
+        if (!blank && line < projection.rows().size()
+                && projection.rows().get(line).status() != FileProjection.Status.UNREVIEWED) return;
+        Kind kind = blank ? Kind.BLANK : Kind.UNREVIEWED;
+        if (!result.isEmpty()) {
+            var prior = result.getLast();
+            // A zero-width EOF row must survive independently of an LF-owning preceding span.
+            if (end > start && prior.kind() == kind && prior.end() == start) {
+                result.set(result.size() - 1, new Run(prior.start(), end, kind));
+                return;
+            }
+        }
+        result.add(new Run(start, end, kind));
     }
 
     private static void append(List<Run> result, List<ReviewedRange> ranges, Kind kind) {
@@ -81,19 +118,18 @@ final class ReviewStripeModel {
         if (mapping.height() <= 0 || editor.isDisposed() || snapshot.stamp() != editor.getDocument().getModificationStamp()) return List.of();
         int height = (int) Math.ceil(mapping.height() / mapping.scale());
         int length = editor.getDocument().getTextLength();
-        CharSequence text = editor.getDocument().getCharsSequence();
         var pixels = new Kind[height];
         for (var run : snapshot.runs()) {
             int start = Math.min(run.start(), length), end = Math.min(run.end(), length);
-            if (run.kind() != Kind.DELETED && start == end) continue;
+            if (run.kind() != Kind.DELETED && run.kind() != Kind.BLANK && start == end) continue;
             int firstLine = editor.offsetToVisualPosition(start).line;
             if (run.kind() == Kind.DELETED) {
                 int[] row = mapping.rows(firstLine, firstLine);
                 if (row[1] <= row[0]) continue;
                 paint(pixels, row[0], row[0] + 2, run.kind());
             } else {
-                // A whole-row range includes LF; its exclusive end must not paint the next row.
-                if (end > start && text.charAt(end - 1) == '\n') end--;
+                // The newline offset belongs to its own logical row. Using the last included
+                // offset also preserves consecutive empty rows without reading live text.
                 int last = Math.max(start, end - 1);
                 int lastLine = editor.offsetToVisualPosition(last).line;
                 int[] rows = mapping.rows(firstLine, lastLine);

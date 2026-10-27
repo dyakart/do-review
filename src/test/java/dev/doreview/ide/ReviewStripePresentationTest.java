@@ -2,6 +2,7 @@ package dev.doreview.ide;
 
 import com.intellij.ide.DataManager;
 import com.intellij.openapi.actionSystem.CommonDataKeys;
+import com.intellij.openapi.application.ApplicationManager;
 import com.intellij.openapi.command.WriteCommandAction;
 import com.intellij.openapi.editor.Document;
 import com.intellij.openapi.editor.Editor;
@@ -14,12 +15,18 @@ import com.intellij.openapi.editor.impl.EditorImpl;
 import com.intellij.openapi.fileEditor.FileEditorManager;
 import com.intellij.openapi.fileEditor.impl.text.TextEditorComponent;
 import com.intellij.openapi.util.Disposer;
+import com.intellij.testFramework.LightVirtualFile;
 import com.intellij.testFramework.PlatformTestUtil;
 import com.intellij.testFramework.fixtures.BasePlatformTestCase;
 import com.intellij.testFramework.fixtures.CodeInsightTestFixture;
 import com.intellij.testFramework.fixtures.IdeaTestFixtureFactory;
 import com.intellij.testFramework.fixtures.impl.TempDirTestFixtureImpl;
 import com.intellij.util.ui.JBUI;
+import dev.doreview.core.ContextMap;
+import dev.doreview.core.FileProjection;
+import dev.doreview.core.ReviewHistory;
+import dev.doreview.core.ReviewHistoryEngine;
+import dev.doreview.core.ReviewedRange;
 
 import javax.imageio.ImageIO;
 import javax.swing.JPanel;
@@ -36,7 +43,11 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 /** Real editor host, cached rendering and independent project-wide stripe resources. */
 public final class ReviewStripePresentationTest extends BasePlatformTestCase {
@@ -91,15 +102,25 @@ public final class ReviewStripePresentationTest extends BasePlatformTestCase {
         fresh(editor.getDocument());
         var panel = panel(editor);
         assertNotNull(panel);
-        assertEquals(2, panel.currentSnapshot().runs().size());
-        assertTrue(panel.currentSnapshot().runs().stream().allMatch(run -> run.kind() == ReviewStripeModel.Kind.REVIEWED));
+        assertEquals(2L, panel.currentSnapshot().runs().stream().filter(run -> run.kind() == ReviewStripeModel.Kind.REVIEWED).count());
+        assertEquals(2L, panel.currentSnapshot().runs().stream().filter(run -> run.kind() == ReviewStripeModel.Kind.BLANK).count());
+        assertEquals(2, service.coverage(editor.getDocument()).reviewed());
+        assertEquals(2, service.coverage(editor.getDocument()).total());
+        assertEquals(-1, service.nextUnreviewedLine(editor.getDocument(), 0));
+        assertTrue(Arrays.stream(editor.getMarkupModel().getAllHighlighters())
+                .filter(highlighter -> Boolean.TRUE.equals(highlighter.getUserData(ReviewMarkKeys.REVIEWED_HIGHLIGHTER)))
+                .noneMatch(highlighter -> highlighter.getStartOffset() == editor.getDocument().getLineStartOffset(1)));
         var history = service.history(editor.getDocument());
         settings.setShown(false); settings.setShown(true);
         assertEquals(history, service.history(editor.getDocument()));
 
         myFixture.performEditorAction("ReviewMarks.Clear");
         fresh(editor.getDocument());
-        assertEmpty(panel(editor).currentSnapshot().runs());
+        assertTrue(panel(editor).currentSnapshot().runs().stream().allMatch(run ->
+                run.kind() == ReviewStripeModel.Kind.BLANK || run.kind() == ReviewStripeModel.Kind.UNREVIEWED));
+        assertEquals(0, service.coverage(editor.getDocument()).reviewed());
+        assertEquals(2, service.coverage(editor.getDocument()).total());
+        assertEquals(2, service.nextUnreviewedLine(editor.getDocument(), 0));
     }
 
     public void testLateHostAndRelease() {
@@ -189,6 +210,7 @@ public final class ReviewStripePresentationTest extends BasePlatformTestCase {
     public void testScaleAndTheme() {
         var editor = open("colors.py", "first\nsecond\nthird\nlast");
         settings.setShown(true);
+        fresh(editor.getDocument());
         var host = ReviewStripeHost.find(editor);
         host.setSize(800, 100); layout(host);
         var stripe = panel(editor);
@@ -214,7 +236,8 @@ public final class ReviewStripePresentationTest extends BasePlatformTestCase {
             var track = stripe.trackBounds();
             for (var band : stripe.bands()) {
                 Color expected = switch (band.kind()) {
-                    case REVIEWED -> green;
+                    case BLANK, REVIEWED -> green;
+                    case UNREVIEWED -> editor.getColorsScheme().getDefaultBackground();
                     case NEEDS_REVIEW -> yellow;
                     case CHANGED -> changed;
                     case DELETED -> deleted;
@@ -283,6 +306,202 @@ public final class ReviewStripePresentationTest extends BasePlatformTestCase {
         assertTrue(panel(editor).bands().stream().anyMatch(band -> band.kind() == ReviewStripeModel.Kind.CHANGED));
     }
 
+    public void testBlankFillUsesReviewedColorAndSeparateTooltip() {
+        var editor = open("blank-fill.py", "first = 1\n \t\nsecond = 2\n");
+        var document = editor.getDocument();
+        settings.setShown(true);
+        service.mark(document, 0, document.getTextLength());
+        fresh(document);
+        var stripe = panel(editor);
+        var host = ReviewStripeHost.find(editor);
+        host.setSize(800, 200); layout(host);
+        var image = new BufferedImage(stripe.getWidth(), stripe.getHeight(), BufferedImage.TYPE_INT_RGB);
+        var graphics = image.createGraphics();
+        try { stripe.printAll(graphics); } finally { graphics.dispose(); }
+        var blank = stripe.bands().stream().filter(band -> band.kind() == ReviewStripeModel.Kind.BLANK).findFirst().orElseThrow();
+        var reviewed = stripe.bands().stream().filter(band -> band.kind() == ReviewStripeModel.Kind.REVIEWED).findFirst().orElseThrow();
+        int top = stripe.trackBounds().y;
+        assertEquals("Blank separators connect the same reviewed green without adding editor highlights",
+                image.getRGB(3, top + reviewed.y()), image.getRGB(3, top + blank.y()));
+        var mouse = new MouseEvent(stripe, MouseEvent.MOUSE_MOVED, 0, 0, 3, top + blank.y(), 0, false);
+        assertEquals("DoReview — blank line, no review required", stripe.getToolTipText(mouse));
+        assertTrue(service.projection(document).rows().get(1).evidenceRefs().isEmpty());
+        assertEquals(FileProjection.Status.UNREVIEWED, service.projection(document).rows().get(1).status());
+    }
+
+    public void testWorkerUsesFrozenTextAndCannotRestoreInvalidatedSnapshot() {
+        settings.setShown(true);
+        var editor = standaloneEditor("\n");
+        var gate = new BlockingCapture();
+        var presentation = new ReviewStripePresentation(getProject(), getTestRootDisposable(), gate);
+        var document = editor.getDocument();
+        presentation.render(editor, unreviewed(document.getText()));
+        try {
+            await(gate.started::get);
+            var stripe = panel(editor);
+            assertNull(stripe.currentSnapshot());
+            presentation.invalidate(document);
+            WriteCommandAction.runWriteCommandAction(getProject(), () -> document.insertString(0, "code"));
+            presentation.render(editor, unreviewed(document.getText()));
+            await(() -> stripe.currentSnapshot() != null);
+            var current = stripe.currentSnapshot();
+            assertEquals("\n", gate.frozen.get());
+            assertEquals(document.getModificationStamp(), current.stamp());
+            assertTrue(current.runs().stream().anyMatch(run -> run.kind() == ReviewStripeModel.Kind.UNREVIEWED));
+            gate.release.countDown();
+            await(gate.finished::get); flush();
+            assertSame("An obsolete worker must not restore the pre-edit blank snapshot", current, stripe.currentSnapshot());
+        } finally { gate.release.countDown(); Disposer.dispose(presentation); }
+    }
+
+    public void testOneWorkerAndSnapshotAreSharedAcrossSplitEditors() {
+        settings.setShown(true);
+        var first = standaloneEditor("\ncode\n");
+        var second = standaloneEditor(first.getDocument());
+        var gate = new BlockingCapture();
+        var presentation = new ReviewStripePresentation(getProject(), getTestRootDisposable(), gate);
+        var projection = unreviewed(first.getDocument().getText());
+        presentation.render(first, projection);
+        presentation.render(second, projection);
+        try {
+            await(gate.started::get);
+            assertEquals(1, gate.calls.get());
+            presentation.release(second);
+            assertNull(panel(second));
+            gate.release.countDown();
+            await(() -> panel(first).currentSnapshot() != null);
+            assertEquals("Closing one split keeps the surviving document's worker", 1, gate.calls.get());
+            presentation.render(second, projection);
+            assertSame(panel(first).currentSnapshot(), panel(second).currentSnapshot());
+        } finally { gate.release.countDown(); Disposer.dispose(presentation); }
+    }
+
+    public void testProjectionReplacementAtSameStampSuppressesOldWorker() {
+        settings.setShown(true);
+        var editor = standaloneEditor("code");
+        var document = editor.getDocument();
+        var gate = new BlockingCapture();
+        var presentation = new ReviewStripePresentation(getProject(), getTestRootDisposable(), gate);
+        presentation.render(editor, unreviewed(document.getText()));
+        try {
+            await(gate.started::get);
+            long stamp = document.getModificationStamp();
+            var history = ReviewHistoryEngine.review(ReviewHistory.empty(), document.getText(),
+                    List.of(new ReviewedRange(0, document.getTextLength())), 1);
+            var context = ContextMap.fallback(document.getText());
+            var reviewed = ReviewHistoryEngine.project(history, document.getText(),
+                    Map.of(history.evidence().getFirst().snapshotId(), context), context, null);
+            presentation.render(editor, reviewed);
+            await(() -> panel(editor).currentSnapshot() != null);
+            var current = panel(editor).currentSnapshot();
+            assertEquals(stamp, current.stamp());
+            assertTrue(current.runs().stream().anyMatch(run -> run.kind() == ReviewStripeModel.Kind.REVIEWED));
+            gate.release.countDown();
+            await(gate.finished::get); flush();
+            assertSame("Matching document stamps cannot make an older projection eligible again",
+                    current, panel(editor).currentSnapshot());
+        } finally { gate.release.countDown(); Disposer.dispose(presentation); }
+    }
+
+    public void testDisableCancelsWorkerAndReenableStartsFreshCapture() {
+        settings.setShown(true);
+        var editor = standaloneEditor("\n");
+        var gate = new BlockingCapture();
+        var presentation = new ReviewStripePresentation(getProject(), getTestRootDisposable(), gate);
+        presentation.render(editor, unreviewed(editor.getDocument().getText()));
+        try {
+            await(gate.started::get);
+            var obsoletePanel = panel(editor);
+            settings.setShown(false);
+            assertNull(panel(editor));
+            settings.setShown(true);
+            await(() -> panel(editor).currentSnapshot() != null);
+            var current = panel(editor).currentSnapshot();
+            assertEquals(2, gate.calls.get());
+            assertNotSame(gate.firstResult.get(), current);
+            gate.release.countDown();
+            await(gate.finished::get); flush();
+            assertNull(obsoletePanel.currentSnapshot());
+            assertSame(current, panel(editor).currentSnapshot());
+            for (int i = 0; i < 5; i++) { settings.setShown(false); settings.setShown(true); }
+            assertEquals("A completed snapshot may be reused after toggling", 2, gate.calls.get());
+            assertSame(current, panel(editor).currentSnapshot());
+            assertEquals(1, stripeCount(editor));
+        } finally { gate.release.countDown(); Disposer.dispose(presentation); }
+    }
+
+    public void testLastEditorReleaseSuppressesPendingWorker() { assertStoppedWorker(false); }
+
+    public void testDisposeSuppressesPendingWorker() { assertStoppedWorker(true); }
+
+    private void assertStoppedWorker(boolean dispose) {
+        settings.setShown(true);
+        var editor = standaloneEditor("\n");
+        var gate = new BlockingCapture();
+        var presentation = new ReviewStripePresentation(getProject(), getTestRootDisposable(), gate);
+        presentation.render(editor, unreviewed(editor.getDocument().getText()));
+        try {
+            await(gate.started::get);
+            var obsolete = panel(editor);
+            if (dispose) Disposer.dispose(presentation); else presentation.release(editor);
+            assertNull(panel(editor));
+            gate.release.countDown();
+            await(gate.finished::get); flush();
+            assertNull(obsolete.currentSnapshot());
+            assertNull(panel(editor));
+        } finally { gate.release.countDown(); Disposer.dispose(presentation); }
+    }
+
+    private Editor standaloneEditor(String text) {
+        return standaloneEditor(EditorFactory.getInstance().createDocument(text));
+    }
+
+    private Editor standaloneEditor(Document document) {
+        var file = new LightVirtualFile("stripe-worker.txt", document.getText());
+        var editor = EditorFactory.getInstance().createEditor(document, getProject(), file, false, EditorKind.MAIN_EDITOR);
+        new TextEditorComponent(file, (EditorImpl) editor);
+        assertFalse("Worker fixtures must not also be rendered by the project service", service.supports(document));
+        Disposer.register(getTestRootDisposable(), () -> {
+            if (!editor.isDisposed()) EditorFactory.getInstance().releaseEditor(editor);
+        });
+        return editor;
+    }
+
+    private static FileProjection unreviewed(String text) {
+        return ReviewHistoryEngine.project(ReviewHistory.empty(), text, Map.of(), ContextMap.fallback(text), null);
+    }
+
+    private static final class BlockingCapture implements ReviewStripePresentation.SnapshotCapture {
+        final AtomicInteger calls = new AtomicInteger();
+        final AtomicBoolean started = new AtomicBoolean(), finished = new AtomicBoolean();
+        final AtomicReference<String> frozen = new AtomicReference<>();
+        final AtomicReference<ReviewStripeModel.Snapshot> firstResult = new AtomicReference<>();
+        final CountDownLatch release = new CountDownLatch(1);
+
+        @Override public ReviewStripeModel.Snapshot capture(FileProjection projection, CharSequence text, long stamp) {
+            assertFalse("Stripe capture must run off EDT", ApplicationManager.getApplication().isDispatchThread());
+            assertFalse("The text-only pass must not hold a read action", ApplicationManager.getApplication().isReadAccessAllowed());
+            var result = ReviewStripeModel.capture(projection, text, stamp);
+            if (calls.incrementAndGet() == 1) {
+                frozen.set(text.toString()); firstResult.set(result); started.set(true);
+                boolean interrupted = false;
+                try {
+                    // Complete even after cancellation to exercise the stale-delivery guard.
+                    while (true) try { release.await(); break; }
+                    catch (InterruptedException ignored) { interrupted = true; }
+                } finally {
+                    finished.set(true);
+                    if (interrupted) Thread.currentThread().interrupt();
+                }
+            }
+            return result;
+        }
+    }
+
+    private static void await(java.util.function.BooleanSupplier condition) {
+        PlatformTestUtil.waitWithEventsDispatching("Current stripe snapshot did not finish", condition, 10);
+    }
+
     private Editor open(String name, String text) {
         var file = myFixture.addFileToProject(name, text).getVirtualFile();
         FileEditorManager.getInstance(getProject()).openFile(file, true);
@@ -302,6 +521,9 @@ public final class ReviewStripePresentationTest extends BasePlatformTestCase {
     private void fresh(Document document) {
         PlatformTestUtil.waitWithEventsDispatching("Current stripe projection did not finish", () -> service.isProjectionReady(document), 10);
         flush();
+        if (settings.isShown()) await(() -> Arrays.stream(EditorFactory.getInstance().getEditors(document, getProject()))
+                .filter(editor -> ReviewStripeHost.find(editor) != null)
+                .allMatch(editor -> panel(editor) != null && panel(editor).currentSnapshot() != null));
     }
 
     private static ReviewStripePanel panel(Editor editor) {

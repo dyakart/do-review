@@ -2,6 +2,7 @@ package dev.doreview.ide;
 
 import com.intellij.openapi.editor.Document;
 import com.intellij.openapi.editor.Editor;
+import com.intellij.openapi.editor.EditorFactory;
 import com.intellij.openapi.editor.EditorKind;
 import com.intellij.openapi.editor.ex.EditorEx;
 import com.intellij.openapi.fileEditor.FileEditorManager;
@@ -211,6 +212,10 @@ public final class ReviewStripeOverviewTest extends FileEditorManagerTestCase {
 
     private void fresh(Document document) {
         PlatformTestUtil.waitWithEventsDispatching("Current overview projection did not finish", () -> service.isProjectionReady(document), 10);
+        PlatformTestUtil.waitWithEventsDispatching("Current overview stripe snapshot did not finish", () ->
+                Arrays.stream(EditorFactory.getInstance().getEditors(document, getProject()))
+                        .filter(editor -> ReviewStripeHost.find(editor) != null)
+                        .allMatch(editor -> stripe(editor).currentSnapshot() != null), 10);
         PlatformTestUtil.dispatchAllInvocationEventsInIdeEventQueue();
     }
 
