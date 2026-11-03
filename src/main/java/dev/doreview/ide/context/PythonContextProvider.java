@@ -6,6 +6,7 @@ import com.intellij.psi.PsiFile;
 import com.jetbrains.python.psi.*;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Set;
 
@@ -17,15 +18,8 @@ public final class PythonContextProvider extends StructuredPsiContextProvider {
 
     @Override protected void collect(PsiElement element, List<Scope> scopes) {
         if (element instanceof PyStatementList node) {
-            PyStatement[] statements = node.getStatements();
-            int end = statements.length == 0 ? 0 : statements[statements.length - 1].getTextRange().getEndOffset();
-            for (int index = 0; index + 1 < statements.length; index++) {
-                PyStatement statement = statements[index];
-                if (containsGate(statement, PythonContextProvider::isGate, PythonContextProvider::isDeclaration)) {
-                    followingGuard(scopes, node, statement, statements[index + 1], end,
-                            literalPayloads(statement, PythonContextProvider::gatePayloads, PythonContextProvider::isDeclaration));
-                }
-            }
+            followingGuards(scopes, node, Arrays.asList(node.getStatements()), PythonContextProvider::isGate,
+                    PythonContextProvider::isDeclaration, PythonContextProvider::gatePayloads);
         } else if (element instanceof PyFunction node) {
             add(scopes, node, "function", prefix(node, node.getStatementList()));
         } else if (element instanceof PyClass node) {

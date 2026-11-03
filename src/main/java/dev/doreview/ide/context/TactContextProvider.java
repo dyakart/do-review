@@ -39,15 +39,8 @@ public final class TactContextProvider extends StructuredPsiContextProvider {
 
     @Override protected void collect(PsiElement element, List<Scope> scopes) {
         if (element instanceof TactBlock node) {
-            List<TactStatement> statements = node.getStatementList();
-            int end = statements.isEmpty() ? 0 : statements.getLast().getTextRange().getEndOffset();
-            for (int index = 0; index + 1 < statements.size(); index++) {
-                TactStatement statement = statements.get(index);
-                if (containsGate(statement, TactContextProvider::isGate, TactContextProvider::isDeclaration)) {
-                    followingGuard(scopes, node, statement, statements.get(index + 1), end,
-                            literalPayloads(statement, TactContextProvider::gatePayloads, TactContextProvider::isDeclaration));
-                }
-            }
+            followingGuards(scopes, node, node.getStatementList(), TactContextProvider::isGate,
+                    TactContextProvider::isDeclaration, TactContextProvider::gatePayloads);
         } else if (element instanceof TactFunctionDeclaration node) {
             add(scopes, node, "function", prefix(node, node.getBlock()));
         } else if (element instanceof TactAsmFunctionDeclaration node) {

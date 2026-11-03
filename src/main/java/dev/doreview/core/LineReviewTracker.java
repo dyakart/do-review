@@ -1,10 +1,9 @@
 package dev.doreview.core;
 
 import java.util.ArrayList;
-import java.util.List;
-import java.util.Objects;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -28,9 +27,7 @@ public final class LineReviewTracker {
 
     public static List<ReviewedRange> applyEdit(String previous, String current,
             List<ReviewedRange> marks, int offset, int oldLength, int newLength) {
-        Objects.requireNonNull(previous, "previous");
-        Objects.requireNonNull(current, "current");
-        validateEdit(previous, current, offset, oldLength, newLength);
+        DocumentEditWindow.validate(previous, current, offset, oldLength, newLength);
         var reviewed = ReviewRanges.normalized(marks);
         for (var range : reviewed) {
             if (range.end() > previous.length()) {
@@ -41,27 +38,11 @@ public final class LineReviewTracker {
             return reviewed;
         }
 
-        int oldEditEnd = offset + oldLength;
         int delta = newLength - oldLength;
-        int windowStart = previous.lastIndexOf('\n', offset - 1) + 1;
-        int oldWindowEnd;
-        if (oldLength == 0 && offset == windowStart) {
-            oldWindowEnd = offset;
-        } else {
-            int finalTouched = oldLength == 0 ? offset : oldEditEnd - 1;
-            int newline = previous.indexOf('\n', finalTouched);
-            oldWindowEnd = newline < 0 ? previous.length() : newline + 1;
-        }
-        int newWindowEnd = oldWindowEnd + delta;
-        // A consumed LF or inserted partial row can join the following old row.
-        // Include that row on both sides so a cropped prefix cannot appear exact.
-        if (newWindowEnd > 0 && newWindowEnd < current.length()
-                && current.charAt(newWindowEnd - 1) != '\n') {
-            int newline = current.indexOf('\n', newWindowEnd);
-            int fullLineEnd = newline < 0 ? current.length() : newline + 1;
-            oldWindowEnd += fullLineEnd - newWindowEnd;
-            newWindowEnd = fullLineEnd;
-        }
+        var window = DocumentEditWindow.ofValidatedEdit(previous, current, offset, oldLength, newLength);
+        int windowStart = window.start();
+        int oldWindowEnd = window.oldEnd();
+        int newWindowEnd = window.newEnd();
         var insertedRows = provenInsertedRows(previous, current, offset, oldLength, newLength, windowStart, oldWindowEnd);
 
         var retained = new ArrayList<ReviewedRange>();
@@ -177,18 +158,4 @@ public final class LineReviewTracker {
     }
 
     record KnownRows(Map<Integer, Integer> exactRows, Set<Integer> conflictedRows) { }
-
-    private static void validateEdit(String previous, String current, int offset, int oldLength, int newLength) {
-        if (offset < 0 || oldLength < 0 || newLength < 0
-                || (long) offset + oldLength > previous.length()
-                || (long) offset + newLength > current.length()
-                || (long) previous.length() - oldLength + newLength != current.length()) {
-            throw new IllegalArgumentException("Invalid document edit coordinates");
-        }
-        int suffix = previous.length() - offset - oldLength;
-        if (!previous.regionMatches(0, current, 0, offset)
-                || !previous.regionMatches(offset + oldLength, current, offset + newLength, suffix)) {
-            throw new IllegalArgumentException("Snapshots do not match the supplied document edit");
-        }
-    }
 }

@@ -15,11 +15,38 @@ DoReview targets PyCharm 2026.2 (platform 262). It shares review evidence throug
 | `ReviewEditorPresentation`, stripe classes | Editor resources and rendering from immutable `FileProjection` values. |
 | `ReviewHistoryActions`, `ReviewGitHistory` | Version comparison, exact Git content labels, authors and explicit history attachment. |
 
+Public facades retain the entry points used by actions, tests and serialized state. Package-private helpers separate internal responsibilities without introducing another dependency layer:
+
+- `DocumentEditWindow` validates edit coordinates and calculates the same affected full-row window for the line tracker and provenance hints.
+- `ProjectionHints` remains the immutable public value. `ProjectionHintCheckpoints`, `ProjectionHintOrigins` and `ProjectionHintEdits` implement checkpoint preparation, origin collection/merging and edit transport respectively.
+- `ReviewHistoryEngine` classifies historical proof rows. `ProjectionAccumulator` collects their row contributions, diagnostics and deletion anchors, then builds the immutable result in the existing order.
+- `SharedHistoryRepository` owns its connection, synchronization, transactions, pending recovery and publication fences. `SharedHistoryFiles` handles shared paths and immutable file writes; `SharedHistoryCodec` validates JSON and copies persisted values; `SharedHistoryMaterializer` reconstructs file history from the event graph.
+- `SharedReviewHistoryStore` owns the serial worker, sessions and views. `SharedHistoryLegacyImporter` performs legacy XML import and migration completion tracking on that worker.
+
+The main data flow is:
+
+```mermaid
+flowchart TD
+    Portable["Checked-out .doreview events and snapshots"] --> Repository["Repository: SQLite index and durable pending work"]
+    Repository --> Store["Storage worker: warmed file models"]
+    Store --> Capture["Read phase: immutable text and context"]
+    Capture --> Compute["Pooled task: core projection and checkpoint"]
+    Compute --> Delivery["EDT: validate task and document identity"]
+    Delivery --> Editor["Editor highlighting, stripe and coverage"]
+    Delivery --> Pending["Frozen checkpoint or review state"]
+    Pending --> Repository
+    Repository --> Portable
+```
+
+Pending state is durable local work until publication succeeds. The diagram's return path is a storage operation; it does not stage, commit or push Git files.
+
 ## Review model
 
 `ReviewHistory` contains content-addressed `FileSnapshot` values, explicit `ReviewEvidence` and targeted `Revocation` records. Edits change the projection, not saved evidence. Returning to old text cannot override an explicit revocation; a later review creates new evidence.
 
 Green requires exact text, unambiguous origin and matching context. Local edit hints preserve original-row identity, so inserting an identical copy does not review the copy. Ambiguous external changes remain unconfirmed. Blank rows are excluded from marking, coverage and deletion markers. Projection work shares a four-million-cell quadratic diff budget; unresolved matches remain unconfirmed when it is exhausted.
+
+Snapshots normalize CRLF and CR line endings to LF and use the SHA-256 of their UTF-8 text as identity. Review ranges use nonempty, half-open UTF-16 document offsets, matching the IDE's offset model. Range calculations must retain the distinction between a complete-row insertion, a partial-row insertion and an edit that consumes a newline.
 
 ## Execution and concurrency
 
@@ -28,6 +55,15 @@ Green requires exact text, unambiguous origin and matching context. Local edit h
 Delivery checks document identity, modification stamp, task generation, history revision, storage epoch and context-provider generation. `beforeDocumentChange` synchronously clears confirmed highlighting and stripe snapshots before range markers can expand over inserted text.
 
 Persistence uses an application-owned serial worker. Initial loading, filesystem scans, database work and cold decoding run off EDT; UI consumers use warmed immutable models. Queued writes carry frozen state. Cancellation or failure must not publish stale green marks.
+
+The document lifecycle preserves this order:
+
+1. Before an edit, capture available origin hints and synchronously remove confirmed presentation.
+2. After the edit, transport or reload hints, save pending provenance and request a fresh projection.
+3. Capture syntax context under a cancellable read action; compute the projection outside the read lock.
+4. Validate all delivery guards on EDT before publishing presentation and committing a prepared checkpoint.
+
+Independent clear commands retain their captured evidence and checkout identity while ordinary document projections can supersede one another. Releasing the last editor cancels document work and releases its runtime state. Split editors share document data but own their presentation resources separately.
 
 ## Shared artifacts and local storage
 
@@ -40,6 +76,13 @@ Git sharing uses ordinary user commits and pushes. DoReview does not stage files
 SQLite stores the local index, compressed snapshot copies and pending provenance. On Windows its path is `%LOCALAPPDATA%/DoReview/worktrees/<canonical-root-SHA256>/history.sqlite3`; macOS uses `~/Library/Application Support/DoReview`, and Linux uses `$XDG_DATA_HOME/DoReview` or `~/.local/share/DoReview` as the data root. `doreview.data.path` overrides that root for isolated tests. Worktree keys resolve real paths where possible and fold case on Windows.
 
 The database uses schema 1, WAL, full synchronization and a bounded busy timeout. Pending provenance is checkout-bound and durable until successfully published; the database must not be treated as a disposable cache while pending work exists. Database files stay outside Git. `SharedHistoryRepository.backup` uses SQLite's backup API to include committed WAL contents consistently.
+
+Compatibility boundaries are explicit:
+
+- Portable events remain version 1, with the existing field names and content-addressed snapshot layout. Portable evidence and revocations omit local `sequence` values; materialization derives their order from causal history.
+- Checkpoint payloads accept versions 1 and 2 and retain their validation/checksum rules. A checkpoint constrains existing evidence and cannot create new reviewed rows.
+- Local pending envelopes accept versions 1 and 2, including recovery of older envelopes with embedded snapshots. Publication retains the order `savePending → publish → acknowledgePending`.
+- Legacy XML state beans keep their public names and fields. Invalid or future formats retain their existing rejection/preservation behavior; refactoring does not migrate their schema.
 
 Existing XML history is imported in the background as **Imported history**, preserving an XML backup in the IDE configuration's `review-marks-legacy-backups` directory. Imported checkpoints merge independently with current provenance; validation preserves origin denials and never creates review evidence.
 
@@ -58,6 +101,20 @@ Git lookup runs off EDT with bounded history, output and execution time. It foll
 Optional Python, Tact and Tolk adapters fingerprint declarations, control-flow headers, branch roles and preceding guards or early exits. Unsupported languages use a whole-file fingerprint. Provider failures and uncertain parse regions produce unknown context.
 
 Tact assembly fingerprints include the header and complete body. Recovery requires verified declaration boundaries. `TactSyntaxRecovery` performs one bounded parse of an in-memory masked copy with lexer-checked boundaries; it never repairs source. Analysis and caches are bounded; provider changes invalidate them and projections through a generation counter.
+
+The shared preceding-guard traversal handles statement order only. Each adapter retains its own declaration boundaries, gate recognition and literal-payload rules. Provider IDs retain `structure-v4`, so a structural refactor must produce the same fingerprints for the same source and plugin versions.
+
+## Work bounds
+
+These are existing limits, not tuning targets for a refactor:
+
+- Quadratic matching: 4,000,000 cells per projection/checkpoint workspace, with a 1,000,000-cell limit for an individual diff gap. Exact and linear matching paths remain available after the quadratic allowance is exhausted.
+- Syntax context capture: at most 64 historical snapshots, 10,000,000 characters in total and 2,000,000 characters per snapshot. Excluded snapshots receive unknown context.
+- Context cache: at most 256 entries and 200,000 rows, invalidated on provider changes.
+- Shared artifact reads: 32 MiB per event and 128 MiB per snapshot.
+- Git version labels: up to 256 commits, 4 MiB of log output, 4 MiB per blob and 16 MiB of blob content in total, within a three-second lookup deadline. Results use the existing 30-second cache.
+
+These bounds cover different operations. The diff allowance does not bound all history scans, PSI work, filesystem I/O or editor painting. See [Development](DEVELOPMENT.md) for performance fixture coverage and [Known issues](KNOWN_ISSUES.md) for verification limits.
 
 ## Editor lifecycle and stripe
 

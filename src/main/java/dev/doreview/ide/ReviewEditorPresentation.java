@@ -66,6 +66,12 @@ final class ReviewEditorPresentation implements Disposable {
         stripe.render(editor, projection);
         if (projection == null) { removeShortcut(editor); return; }
         installShortcut(editor);
+        var created = new ArrayList<RangeHighlighter>();
+        for (var run : highlightRuns(editor, projection)) created.add(createHighlighter(editor, run));
+        if (!created.isEmpty()) highlights.put(editor, created);
+    }
+
+    private List<HighlightRun> highlightRuns(Editor editor, FileProjection projection) {
         var runs = new ArrayList<HighlightRun>();
         for (var row : projection.rows()) {
             if (row.status() == FileProjection.Status.UNREVIEWED) continue;
@@ -81,27 +87,27 @@ final class ReviewEditorPresentation implements Disposable {
             }
             runs.add(current);
         }
-        var created = new ArrayList<RangeHighlighter>();
-        for (var run : runs) {
-            boolean green = run.status() == FileProjection.Status.REVIEWED;
-            boolean yellow = run.status() == FileProjection.Status.NEEDS_REVIEW;
-            int end = run.end();
-            if (end > run.start() && editor.getDocument().getCharsSequence().charAt(end - 1) == '\n') end--;
-            var attributes = green ? ReviewHighlighting.attributesFor(editor.getColorsScheme())
-                    : yellow ? ReviewHighlighting.needsReviewAttributesFor(editor.getColorsScheme()) : null;
-            var highlighter = editor.getMarkupModel().addRangeHighlighter(run.start(), end,
-                    HighlighterLayer.SELECTION - 1, attributes, HighlighterTargetArea.LINES_IN_RANGE);
-            highlighter.putUserData(green ? ReviewMarkKeys.REVIEWED_HIGHLIGHTER
-                    : yellow ? ReviewMarkKeys.NEEDS_REVIEW_HIGHLIGHTER : ReviewMarkKeys.CHANGED_HIGHLIGHTER, true);
-            String reason = green ? "Reviewed — exact text and context confirmed"
-                    : yellow ? "Needs review: " + run.reason().name().toLowerCase(Locale.ROOT).replace('_', ' ')
-                    : "Changed since review";
-            highlighter.setGutterIconRenderer(new ReviewGutterIcon(green, tooltip(reason, run.authors(), true),
-                    () -> showChanges.accept(editor.getDocument())));
-            highlighter.setErrorStripeTooltip(tooltip(reason, run.authors(), false));
-            created.add(highlighter);
-        }
-        if (!created.isEmpty()) highlights.put(editor, created);
+        return runs;
+    }
+
+    private RangeHighlighter createHighlighter(Editor editor, HighlightRun run) {
+        boolean green = run.status() == FileProjection.Status.REVIEWED;
+        boolean yellow = run.status() == FileProjection.Status.NEEDS_REVIEW;
+        int end = run.end();
+        if (end > run.start() && editor.getDocument().getCharsSequence().charAt(end - 1) == '\n') end--;
+        var attributes = green ? ReviewHighlighting.attributesFor(editor.getColorsScheme())
+                : yellow ? ReviewHighlighting.needsReviewAttributesFor(editor.getColorsScheme()) : null;
+        var highlighter = editor.getMarkupModel().addRangeHighlighter(run.start(), end,
+                HighlighterLayer.SELECTION - 1, attributes, HighlighterTargetArea.LINES_IN_RANGE);
+        highlighter.putUserData(green ? ReviewMarkKeys.REVIEWED_HIGHLIGHTER
+                : yellow ? ReviewMarkKeys.NEEDS_REVIEW_HIGHLIGHTER : ReviewMarkKeys.CHANGED_HIGHLIGHTER, true);
+        String reason = green ? "Reviewed — exact text and context confirmed"
+                : yellow ? "Needs review: " + run.reason().name().toLowerCase(Locale.ROOT).replace('_', ' ')
+                : "Changed since review";
+        highlighter.setGutterIconRenderer(new ReviewGutterIcon(green, tooltip(reason, run.authors(), true),
+                () -> showChanges.accept(editor.getDocument())));
+        highlighter.setErrorStripeTooltip(tooltip(reason, run.authors(), false));
+        return highlighter;
     }
 
     void clearConfirmed(Document document) {
