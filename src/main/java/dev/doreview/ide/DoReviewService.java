@@ -47,8 +47,10 @@ import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
+import java.nio.file.Path;
 
 /** Saved facts are immutable; editor projections are disposable and UI-thread confined. */
 @Service(Service.Level.PROJECT)
@@ -123,7 +125,10 @@ public final class DoReviewService implements Disposable {
         if (event.getOldFragment().toString().contentEquals(event.getNewFragment())) return;
         var previous = projection(event.getDocument());
         var state = runtime.get(event.getDocument());
-        if (state.ready) state.hints = state.hints.mergeResolved(ProjectionHints.fromProjection(history(event.getDocument()), previous));
+        state.retainPresentation = false;
+        state.stablePresentation = false;
+        if (isGitDocument(event.getDocument())) state.hints = ProjectionHints.empty();
+        else if (state.ready) state.hints = state.hints.mergeResolved(ProjectionHints.fromProjection(history(event.getDocument()), previous));
         else {
             // Seed newly marked exact facts without dropping earlier coordinate evidence
             // while a worker is still resolving other historical snapshots.
@@ -141,9 +146,10 @@ public final class DoReviewService implements Disposable {
         var state = runtime.get(document);
         if (state != null) {
             String previousText = state.text;
-            state.hints = event.isWholeTextReplaced() ? savedHints(document)
+            boolean git = isGitDocument(document);
+            state.hints = git ? ProjectionHints.empty() : event.isWholeTextReplaced() ? savedHints(document)
                     : state.hints.applyEdit(state.text, document.getText(), event.getOffset(), event.getOldLength(), event.getNewLength());
-            if (!state.ready && !event.isWholeTextReplaced()) {
+            if (!git && !state.ready && !event.isWholeTextReplaced()) {
                 state.hints = state.hints.guardUnresolvedEdit(history(document), previousText, document.getText(),
                         event.getOffset(), event.getOldLength(), event.getNewLength());
             }
@@ -192,18 +198,68 @@ public final class DoReviewService implements Disposable {
     }
 
     private void sharedHistoryUpdated(String path, boolean replacement) {
-        if (replacement) { storeEpoch.incrementAndGet(); historyReloaded(); return; }
         for (var document : List.copyOf(runtime.keySet())) {
             if (path != null && !path.equals(keyFor(document))) continue;
-            scheduler.cancel(document);
-            var state = runtime.get(document);
-            state.stamp = -1;
-            state.ready = false;
-            state.hints = savedHints(document);
-            presentation.clearConfirmed(document);
+            refreshSharedHistory(document);
         }
         reportStorageWarnings();
         refreshAll();
+    }
+
+    private void refreshSharedHistory(Document document) {
+        var state = runtime.get(document);
+        String key = keyFor(document);
+        if (state == null || key == null) return;
+        if (!store.isLoaded(project, key)) {
+            // A background reload may temporarily have no replacement model. Keep a valid
+            // immutable view until loading completes; unreadable history must fail closed.
+            if (store.diagnostics(project).isEmpty()) return;
+            scheduler.cancel(document);
+            state.stamp = -1;
+            state.ready = false;
+            state.retainPresentation = false;
+            state.stablePresentation = false;
+            presentation.clearConfirmed(document);
+            return;
+        }
+        var history = store.history(project, key);
+        var checkpoint = savedHints(document);
+        String checkout = store.checkoutToken(project, key);
+        boolean sameFacts = sameHistoryFacts(state.history, history);
+        boolean sameCheckpoint = checkpoint.equals(state.persistedHints);
+        boolean sameCheckout = Objects.equals(checkout, state.checkout);
+        if (sameFacts && sameCheckpoint && sameCheckout && (state.ready || state.history == history)) {
+            state.history = history;
+            state.revision = history.revision();
+            if (state.projection != null && state.projection.historyRevision() != history.revision()) {
+                var prior = state.projection;
+                state.projection = new FileProjection(prior.currentSnapshotId(), history.revision(), prior.rows(),
+                        prior.reviewedRanges(), prior.yellowRanges(), prior.changedRanges(), prior.deletions());
+            }
+            return;
+        }
+        boolean retain = state.stablePresentation && state.presentationStamp == document.getModificationStamp()
+                && state.contextGeneration == contextGeneration(document)
+                && state.text.equals(document.getText()) && sameCheckpoint && (sameCheckout || isGitDocument(document))
+                && retainsReviewedFacts(state.presentationHistory, history);
+        scheduler.cancel(document);
+        state.stamp = -1;
+        state.ready = false;
+        state.retainPresentation = retain;
+        state.hints = checkpoint;
+        state.persistedHints = checkpoint;
+        state.checkout = checkout;
+        if (!retain) { state.stablePresentation = false; presentation.clearConfirmed(document); }
+    }
+
+    private static boolean sameHistoryFacts(ReviewHistory previous, ReviewHistory current) {
+        return previous != null && previous.snapshots().equals(current.snapshots())
+                && previous.evidence().equals(current.evidence()) && previous.revocations().equals(current.revocations());
+    }
+
+    private static boolean retainsReviewedFacts(ReviewHistory previous, ReviewHistory current) {
+        return previous != null && current.snapshots().entrySet().containsAll(previous.snapshots().entrySet())
+                && current.evidence().containsAll(previous.evidence()) && current.revocations().equals(previous.revocations());
     }
 
     private void registerContextListener() {
@@ -221,28 +277,20 @@ public final class DoReviewService implements Disposable {
 
     private void registerVfsListener() {
         project.getMessageBus().connect(this).subscribe(VirtualFileManager.VFS_CHANGES, new BulkFileListener() {
-            @Override public void before(@NotNull List<? extends VFileEvent> events) {
-                beforeVfsChanges(events);
-            }
             @Override public void after(@NotNull List<? extends VFileEvent> events) {
                 afterVfsChanges(events);
             }
         });
     }
 
-    private void beforeVfsChanges(List<? extends VFileEvent> events) {
-        if (!store.isShared() || events.stream().noneMatch(DoReviewService::historyEvent)) return;
-        storeEpoch.incrementAndGet();
-        scheduler.cancelProjections();
-        for (var document : List.copyOf(runtime.keySet())) presentation.clearConfirmed(document);
-        runtime.clear();
-    }
-
     private void afterVfsChanges(List<? extends VFileEvent> events) {
         boolean changed = false;
         if (store.isShared() && events.stream().anyMatch(DoReviewService::historyEvent)) {
-            store.reloadShared(project); changed = true;
+            // Filesystem hints are not proof that review facts changed. Storage reconciles
+            // the artifacts before its notification invalidates any affected document.
+            store.reconcileShared(project);
         }
+        refreshGitConfiguration(events);
         for (var event : events) {
             if (event instanceof VFileMoveEvent move) {
                 movePath(move.getOldPath(), move.getNewPath());
@@ -267,6 +315,30 @@ public final class DoReviewService implements Disposable {
         // Source edits retain evidence; shared metadata is scoped to the current checkout.
         if (changed) refreshAll();
     }
+
+    private void refreshGitConfiguration(List<? extends VFileEvent> events) {
+        var candidates = events.stream().flatMap(event -> {
+                    if (event instanceof VFileMoveEvent move) return java.util.stream.Stream.of(move.getOldPath(), move.getNewPath());
+                    if (event instanceof VFilePropertyChangeEvent property && property.isRename())
+                        return java.util.stream.Stream.of(property.getOldPath(), property.getNewPath());
+                    return java.util.stream.Stream.of(event.getPath());
+                })
+                .filter(path -> path.endsWith("/config") || path.endsWith("/config.worktree")).toList();
+        if (candidates.isEmpty() || project.getBasePath() == null) return;
+        for (var document : List.copyOf(runtime.keySet())) {
+            if (!isGitDocument(document)) continue;
+            var file = FileDocumentManager.getInstance().getFile(document);
+            Path root = ReviewRepositoryPaths.rootFor(file.toNioPath(), Path.of(project.getBasePath()));
+            if (candidates.stream().noneMatch(path -> ReviewGitConfiguration.affects(root, Path.of(path)))) continue;
+            var state = runtime.get(document);
+            scheduler.cancel(document);
+            state.retainPresentation = state.stablePresentation && state.presentationStamp == document.getModificationStamp()
+                    && state.text.equals(document.getText());
+            state.stamp = -1;
+            state.ready = false;
+            refreshDocument(document);
+        }
+    }
     public boolean supports(Document document) { return keyFor(document) != null; }
     private static boolean historyEvent(VFileEvent event) {
         String path = event.getPath().replace('\\', '/');
@@ -280,21 +352,45 @@ public final class DoReviewService implements Disposable {
     }
     public FileProjection projection(Document document) {
         ApplicationManager.getApplication().assertIsDispatchThread();
-        var history = history(document);
         var state = runtime.get(document);
+        String key = keyFor(document);
+        if (store.isShared() && key != null && !store.isLoaded(project, key) && state != null
+                && state.projection != null && (state.stamp == document.getModificationStamp()
+                || state.stablePresentation && state.presentationStamp == document.getModificationStamp())
+                && store.diagnostics(project).isEmpty()) return state.projection;
+        var history = history(document);
         if (state == null) {
             state = new RuntimeProjection();
             state.hints = savedHints(document);
             runtime.put(document, state);
+        } else if (store.isShared() && state.history != history) {
+            // The worker installs immutable models before posting its EDT notification.
+            // Observe a replacement here as well, so an earlier UI callback cannot use it
+            // with a coincidentally equal numeric revision from a different event set.
+            refreshSharedHistory(document);
         }
         if (state.projection != null && state.stamp == document.getModificationStamp() && state.revision == history.revision()) return state.projection;
         String text = document.getText();
+        boolean retain = state.retainPresentation && state.projection != null && state.text.equals(text)
+                && state.contextGeneration == contextGeneration(document);
+        state.retainPresentation = false;
         state.text = text;
         state.stamp = document.getModificationStamp();
         state.revision = history.revision();
+        state.history = history;
+        state.persistedHints = savedHints(document);
+        state.checkout = key == null ? null : store.checkoutToken(project, key);
+        state.contextGeneration = contextGeneration(document);
         state.ready = history.evidence().isEmpty();
-        // Until PSI finishes, show exact facts as pending, never as unconfirmed green.
-        state.projection = exactProjection(history, text, false);
+        // Stable facts stay visible during background refresh. A real text edit took the
+        // synchronous clear path; syntax-dependent exact facts remain pending until PSI.
+        if (!retain) {
+            boolean git = isGitDocument(document);
+            state.projection = exactProjection(history, text, git);
+            state.stablePresentation = git;
+            state.presentationHistory = history;
+            state.presentationStamp = state.stamp;
+        }
         if (!state.ready) schedule(document, state, history, text);
         return state.projection;
     }
@@ -308,7 +404,7 @@ public final class DoReviewService implements Disposable {
     private static FileProjection exactProjection(ReviewHistory history, String text, boolean contextConfirmed) {
         var exact = exactHistory(history, text);
         var snapshot = FileSnapshot.create(text);
-        var context = contextConfirmed ? ContextMap.fallback(text)
+        var context = contextConfirmed ? ReviewProjectionComputer.gitContext(text)
                 : new ContextMap("pending-context", Collections.nCopies(1 + (int) text.chars().filter(c -> c == '\n').count(), null));
         return ReviewHistoryEngine.project(exact, text, Map.of(snapshot.id(), context), context, ProjectionHints.empty());
     }
@@ -316,20 +412,22 @@ public final class DoReviewService implements Disposable {
         var file = FileDocumentManager.getInstance().getFile(document);
         long stamp = target.stamp, generation = ++target.generation;
         long epoch = storeEpoch.get();
-        long contextGeneration = project.getService(ContextAnalysisManager.class).generation();
+        long contextGeneration = contextGeneration(document);
         var hints = target.hints;
-        var request = new ProjectionRequest(document, target, history, stamp, generation, epoch, contextGeneration);
+        var request = new ProjectionRequest(document, target, history, stamp, generation, epoch, contextGeneration,
+                target.checkout);
         scheduler.schedule(document, () -> computer.capture(history, file, text),
                 contexts -> {
                     var result = computer.computeResult(history, text, hints, contexts);
-                    return new PreparedProjection(result, store.prepareCheckpoint(history, text, result.checkpoint()));
+                    return new PreparedProjection(result, contexts.gitBased() ? null
+                            : store.prepareCheckpoint(history, text, result.checkpoint()));
                 }, prepared -> deliverProjection(request, prepared), failure -> projectionFailed(request, failure));
     }
 
     private void deliverProjection(ProjectionRequest request, PreparedProjection prepared) {
         if (!isCurrentProjection(request)) return;
         String key = keyFor(request.document);
-        if (key == null || !store.commitCheckpoint(project, key, prepared.checkpoint())) {
+        if (key == null || prepared.checkpoint() != null && !store.commitCheckpoint(project, key, prepared.checkpoint())) {
             request.target.stamp = -1;
             refreshDocument(request.document);
             return;
@@ -337,7 +435,11 @@ public final class DoReviewService implements Disposable {
         var result = prepared.result();
         request.target.projection = result.projection();
         request.target.ready = true;
+        request.target.stablePresentation = true;
+        request.target.presentationHistory = request.history;
+        request.target.presentationStamp = request.stamp;
         request.target.hints = result.hints();
+        request.target.persistedHints = savedHints(request.document);
         refreshDocument(request.document);
     }
 
@@ -345,8 +447,14 @@ public final class DoReviewService implements Disposable {
         return !disposed && storeEpoch.get() == request.epoch && runtime.get(request.document) == request.target
                 && request.target.generation == request.generation
                 && request.document.getModificationStamp() == request.stamp
-                && history(request.document).revision() == request.history.revision()
-                && project.getService(ContextAnalysisManager.class).generation() == request.contextGeneration;
+                && matchesCurrentHistory(request)
+                && contextGeneration(request.document) == request.contextGeneration
+                && Objects.equals(request.checkout, store.checkoutToken(project, keyFor(request.document)));
+    }
+
+    private boolean matchesCurrentHistory(ProjectionRequest request) {
+        var current = history(request.document);
+        return current.revision() == request.history.revision() && sameHistoryFacts(request.history, current);
     }
 
     private void projectionFailed(ProjectionRequest request, Throwable failure) {
@@ -360,12 +468,21 @@ public final class DoReviewService implements Disposable {
         refreshDocument(request.document);
     }
     private ProjectionHints savedHints(Document document) {
+        if (isGitDocument(document)) return ProjectionHints.empty();
         String key = keyFor(document);
         return key == null ? ProjectionHints.empty() : store.checkpoint(project, key, document.getText());
     }
     private void savePendingHints(Document document, ProjectionHints hints) {
+        if (isGitDocument(document)) return;
         String key = keyFor(document);
         if (key != null) store.checkpointPending(project, key, document.getText(), hints);
+    }
+
+    private boolean isGitDocument(Document document) {
+        return computer.isGitFile(FileDocumentManager.getInstance().getFile(document));
+    }
+    private long contextGeneration(Document document) {
+        return isGitDocument(document) ? -1 : project.getService(ContextAnalysisManager.class).generation();
     }
     public boolean isProjectionReady(Document document) {
         projection(document);
@@ -477,7 +594,7 @@ public final class DoReviewService implements Disposable {
     }
     private void invalidate(Document document) {
         var state = runtime.get(document);
-        if (state != null) state.stamp = -1;
+        if (state != null) { state.stamp = -1; state.retainPresentation = false; state.stablePresentation = false; }
         refreshDocument(document);
     }
     private boolean deferUntilLoaded(Document document, Runnable command) {
@@ -500,9 +617,12 @@ public final class DoReviewService implements Disposable {
             ApplicationManager.getApplication().invokeLater(this::historyReloaded, project.getDisposed());
             return;
         }
-        if (store.isShared()) scheduler.cancelProjections();
-        else { scheduler.cancelAll(); pendingRevocations = 0; }
-        runtime.clear();
+        if (store.isShared()) {
+            for (var document : List.copyOf(runtime.keySet())) refreshSharedHistory(document);
+        } else {
+            scheduler.cancelAll(); pendingRevocations = 0;
+            runtime.clear();
+        }
         reportStorageWarnings();
         refreshAll();
     }
@@ -511,8 +631,11 @@ public final class DoReviewService implements Disposable {
     }
     private void contextChanged() {
         for (var document : List.copyOf(runtime.keySet())) {
+            if (isGitDocument(document)) continue;
             scheduler.cancel(document);
             runtime.get(document).stamp = -1;
+            runtime.get(document).retainPresentation = false;
+            runtime.get(document).stablePresentation = false;
             presentation.clearConfirmed(document);
         }
         refreshAll();
@@ -625,16 +748,20 @@ public final class DoReviewService implements Disposable {
     }
     private static final class RuntimeProjection {
         String text = "";
-        long stamp = -1, revision = -1, generation;
-        boolean ready;
+        long stamp = -1, revision = -1, generation, contextGeneration, presentationStamp = -1;
+        boolean ready, retainPresentation, stablePresentation;
         int lastMarkedStart = -1, lastMarkedEnd;
         String lastMarkedText;
         ProjectionHints hints = ProjectionHints.empty();
+        ProjectionHints persistedHints = ProjectionHints.empty();
+        ReviewHistory history;
+        ReviewHistory presentationHistory;
+        String checkout;
         FileProjection projection;
     }
     /** Frozen delivery coordinates; mutable projection state remains owned by the EDT service. */
     private record ProjectionRequest(Document document, RuntimeProjection target, ReviewHistory history,
-                                     long stamp, long generation, long epoch, long contextGeneration) { }
+                                     long stamp, long generation, long epoch, long contextGeneration, String checkout) { }
     /** Completion coordinates for an independent command over already captured evidence. */
     private record PendingRevocation(Document document, String key, String text,
                                      long epoch, boolean sharedCommand, String checkout) { }

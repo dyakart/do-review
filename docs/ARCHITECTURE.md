@@ -1,6 +1,6 @@
 # Architecture
 
-DoReview targets PyCharm 2026.2 (platform 262). It shares review evidence through Git and projects it onto current documents. Green confirms matching text, origin and tracked syntax context; it does not establish program correctness.
+DoReview targets PyCharm 2026.2 (platform 262). It shares review evidence through Git and projects it onto current documents. In Git repositories, green follows exact complete lines outside Git diff hunks. Outside Git, it also requires tracked origin and syntax context. Marks do not establish program correctness.
 
 ## Components
 
@@ -22,15 +22,17 @@ Public facades retain the entry points used by actions, tests and serialized sta
 - `ReviewHistoryEngine` classifies historical proof rows. `ProjectionAccumulator` collects their row contributions, diagnostics and deletion anchors, then builds the immutable result in the existing order.
 - `SharedHistoryRepository` owns its connection, synchronization, transactions, pending recovery and publication fences. `SharedHistoryFiles` handles shared paths and immutable file writes; `SharedHistoryCodec` validates JSON and copies persisted values; `SharedHistoryMaterializer` reconstructs file history from the event graph.
 - `SharedReviewHistoryStore` owns the serial worker, sessions and views. `SharedHistoryLegacyImporter` performs legacy XML import and migration completion tracking on that worker.
+- `ReviewGitDiff` supplies line mappings to an operation-local `ReviewProjectionWorkspace`; core remains independent of Git and the IDE. `ContextMap.textOnly()` supplies constant context without constructing a fingerprint for every historical row.
+- `SharedHistoryCheckoutOverlay` owns local branch starting points and event ownership through the repository's connection. `SharedHistoryGitMembership` recognizes exact event blobs deliberately committed in the current HEAD.
 
 The main data flow is:
 
 ```mermaid
 flowchart TD
-    Portable["Checked-out .doreview events and snapshots"] --> Repository["Repository: SQLite index and durable pending work"]
+    Portable["Checked-out .doreview events and snapshots"] --> Repository["Repository: SQLite index, branch basis and pending work"]
     Repository --> Store["Storage worker: warmed file models"]
     Store --> Capture["Read phase: immutable text and context"]
-    Capture --> Compute["Pooled task: core projection and checkpoint"]
+    Capture --> Compute["Pooled task: Git line diff or syntax projection"]
     Compute --> Delivery["EDT: validate task and document identity"]
     Delivery --> Editor["Editor highlighting, stripe and coverage"]
     Delivery --> Pending["Frozen checkpoint or review state"]
@@ -44,24 +46,28 @@ Pending state is durable local work until publication succeeds. The diagram's re
 
 `ReviewHistory` contains content-addressed `FileSnapshot` values, explicit `ReviewEvidence` and targeted `Revocation` records. Edits change the projection, not saved evidence. Returning to old text cannot override an explicit revocation; a later review creates new evidence.
 
-Green requires exact text, unambiguous origin and matching context. Local edit hints preserve original-row identity, so inserting an identical copy does not review the copy. Ambiguous external changes remain unconfirmed. Blank rows are excluded from marking, coverage and deletion markers. Projection work shares a four-million-cell quadratic diff budget; unresolved matches remain unconfirmed when it is exhausted.
+For local Git files, `ReviewProjectionComputer` selects Git before invoking any syntax provider. `git diff --no-index --unified=0` compares each saved reviewed snapshot with the current immutable document text. It honors the repository's `diff.algorithm`; external diff drivers and text conversion are disabled. Complete identical rows outside hunks retain marks. Changed rows and deletions remain diagnostics, additions remain unreviewed, and duplicate-line correspondence follows Git. The index and source files are not modified. Old heuristic checkpoints are ignored in this mode; explicit evidence and revocations remain authoritative.
+
+Outside Git, green requires exact text, unambiguous origin and matching context. Local edit hints preserve original-row identity, so inserting an identical copy does not review the copy. Ambiguous external changes remain unconfirmed. This projection shares a four-million-cell quadratic diff budget; unresolved matches remain unconfirmed when it is exhausted. Blank rows are excluded from marking, coverage and deletion markers in both modes.
 
 Snapshots normalize CRLF and CR line endings to LF and use the SHA-256 of their UTF-8 text as identity. Review ranges use nonempty, half-open UTF-16 document offsets, matching the IDE's offset model. Range calculations must retain the distinction between a complete-row insertion, a partial-row insertion and an edit that consumes a newline.
 
 ## Execution and concurrency
 
-`DoReviewService` and presentation run on the event dispatch thread (EDT). Context capture uses a cancellable non-blocking read action and returns immutable maps; PSI never leaves that phase. Matching and checkpoint preparation run outside the read lock in a separate pooled task. Projection jobs replace older document jobs; frozen revocations survive view refreshes within their checkout.
+`DoReviewService` and presentation run on the event dispatch thread (EDT). Capture uses a cancellable non-blocking read action and returns immutable values; Git capture selects the root and text-only context without parsing historical source. Non-Git capture uses syntax adapters, and PSI never leaves that phase. Git processes, matching and non-Git checkpoint preparation run outside the read lock in a separate pooled task. Projection jobs replace older document jobs; frozen revocations survive view refreshes within their checkout.
 
-Delivery checks document identity, modification stamp, task generation, history revision, storage epoch and context-provider generation. `beforeDocumentChange` synchronously clears confirmed highlighting and stripe snapshots before range markers can expand over inserted text.
+Delivery checks document identity, modification stamp, task generation, immutable history facts, history revision, checkout token, storage epoch and context-provider generation. Equal revision numbers alone cannot identify replacement history. `beforeDocumentChange` synchronously clears confirmed highlighting and stripe snapshots before range markers can expand over inserted text.
+
+VFS events are reconciliation hints. They do not immediately erase all runtime projections. Queued metadata notifications and periodic polls are coalesced on the storage worker, which compares checkout and per-file frontiers before replacing warmed models. Equal histories keep their jobs and presentation. Additive updates can keep a frozen confirmed projection while replacement computation runs, provided text, contexts and supporting evidence are unchanged and no revocation has been added. Actual removals, revocations, unreadable history and text edits invalidate confirmed presentation. Rendering reuses existing highlighters and stripe snapshots when visual runs, colors and document stamp are unchanged. Repository-local `config` and `config.worktree` VFS changes reschedule affected Git projections, including common configuration in linked worktrees.
 
 Persistence uses an application-owned serial worker. Initial loading, filesystem scans, database work and cold decoding run off EDT; UI consumers use warmed immutable models. Queued writes carry frozen state. Cancellation or failure must not publish stale green marks.
 
 The document lifecycle preserves this order:
 
-1. Before an edit, capture available origin hints and synchronously remove confirmed presentation.
-2. After the edit, transport or reload hints, save pending provenance and request a fresh projection.
-3. Capture syntax context under a cancellable read action; compute the projection outside the read lock.
-4. Validate all delivery guards on EDT before publishing presentation and committing a prepared checkpoint.
+1. Before an edit, capture available non-Git origin hints and synchronously remove confirmed presentation.
+2. After the edit, request a fresh projection; transport and save pending provenance only outside Git.
+3. Select the Git root or capture syntax context under a cancellable read action; compute outside the read lock.
+4. Validate all delivery guards on EDT before publishing presentation. Only non-Git projection prepares and commits a checkpoint.
 
 Independent clear commands retain their captured evidence and checkout identity while ordinary document projections can supersede one another. Releasing the last editor cancels document work and releases its runtime state. Split editors share document data but own their presentation resources separately.
 
@@ -69,13 +75,19 @@ Independent clear commands retain their captured evidence and checkout identity 
 
 The nearest ancestor Git working-tree root owns `.doreview`; a nested repository or submodule is a separate boundary. Without Git, the project base directory is the root. Portable paths are relative to that root.
 
-Each operation publishes an immutable JSON batch at `.doreview/v1/events/<prefix>/<uuid>.json`. Events carry author identity, evidence, revocations, aliases, checkpoint constraints and causal parents. LF-normalized UTF-8 snapshots are deduplicated at `.doreview/v1/snapshots/<prefix>/<sha256>.txt`. Snapshot hashes are validated, and `.doreview/.gitattributes` prevents line-ending conversion. Review authors come from Git name/email configuration, falling back to the operating-system username. Any author's valid evidence contributes to coverage.
+An explicit mutation publishes an immutable JSON batch at `.doreview/v1/events/<prefix>/<uuid>.json`. Events carry author identity, evidence, revocations, aliases, checkpoint constraints and causal parents. LF-normalized UTF-8 snapshots are deduplicated at `.doreview/v1/snapshots/<prefix>/<sha256>.txt`. Snapshot hashes are validated, and `.doreview/.gitattributes` prevents line-ending conversion. Identical state produces no event, repeated identical pending state retains its original payload, and ordinary Git edits/projection refreshes do not publish checkpoints. Review authors come from Git name/email configuration, falling back to the operating-system username. Any author's valid evidence contributes to coverage.
 
-Git sharing uses ordinary user commits and pushes. DoReview does not stage files, commit or contact a remote. Rescans reconcile additions and removals: each checkout uses its working-tree event set, not the accumulated union of previously visited branches.
+Publication flushes a sibling temporary file, atomically creates a hard link at the final path, then removes the temporary name. An existing identical file is accepted; different bytes are rejected without replacing the winner. Atomic rename alone is insufficient because POSIX permits replacement of a racing target. A filesystem without hard-link support fails publication safely, retaining durable pending work; no partially visible copy fallback is used.
+
+Git sharing uses ordinary user commits and pushes. DoReview does not stage files, commit or contact a remote. Each canonical worktree has a local overlay keyed by symbolic branch, or by commit for detached HEAD. A branch's first visit freezes the preceding checkout's last successfully observed event set as its inherited basis. Subsequent visits reuse that basis, rather than merging every previously seen branch. Basis events can be materialized from indexed payloads and compressed snapshots without writing portable files.
+
+New local events durably reserve their owning checkout before their portable JSON becomes visible; a crash cannot leave an unowned local operation masquerading as external history. A foreign local event carried untracked between branches is excluded unless it belongs to the current inherited basis or its exact payload and expected path occur in the current HEAD. `ls-tree` membership uses Git blob identity, including SHA-256 repositories, rather than trusting working-file presence. Unknown external events remain shareable. Excluded causal descendants cannot smuggle a foreign operation into the active history.
+
+Rescans reconcile native additions and removals; deleting or resetting a branch's native event does not resurrect it from the cache. An explicit mutation restores missing inherited causal parents before publishing its delta, allowing teammates to reconstruct it. Merely visiting a branch writes no new portable event. Checkout fences reject publication or scan results that cross a checkout change. External SQLite `data_version` changes bypass the metadata shortcut and reconcile the actual active event set, preventing two IDE processes from installing another branch's SQL state. A scan acknowledges only the database version it inspected; concurrent commits require another reconciliation.
 
 SQLite stores the local index, compressed snapshot copies and pending provenance. On Windows its path is `%LOCALAPPDATA%/DoReview/worktrees/<canonical-root-SHA256>/history.sqlite3`; macOS uses `~/Library/Application Support/DoReview`, and Linux uses `$XDG_DATA_HOME/DoReview` or `~/.local/share/DoReview` as the data root. `doreview.data.path` overrides that root for isolated tests. Worktree keys resolve real paths where possible and fold case on Windows.
 
-The database uses schema 1, WAL, full synchronization and a bounded busy timeout. Pending provenance is checkout-bound and durable until successfully published; the database must not be treated as a disposable cache while pending work exists. Database files stay outside Git. `SharedHistoryRepository.backup` uses SQLite's backup API to include committed WAL contents consistently.
+The database uses schema 1, WAL, full synchronization and a bounded busy timeout. Auxiliary `known_checkouts`, `checkout_basis`, `checkout_events`, `checkout_cursor` and `local_event_owners` tables retain local checkout provenance without changing existing tables or the portable format. Pending provenance and inherited branch bases may contain unpublished work; preserve the database when backing them up. Database files stay outside Git. `SharedHistoryRepository.backup` uses SQLite's backup API to include committed WAL contents consistently.
 
 Compatibility boundaries are explicit:
 
@@ -98,7 +110,7 @@ Git lookup runs off EDT with bounded history, output and execution time. It foll
 
 ## Language context
 
-Optional Python, Tact and Tolk adapters fingerprint declarations, control-flow headers, branch roles and preceding guards or early exits. Unsupported languages use a whole-file fingerprint. Provider failures and uncertain parse regions produce unknown context.
+Outside Git, optional Python, Tact and Tolk adapters fingerprint declarations, control-flow headers, branch roles and preceding guards or early exits. Unsupported languages use a whole-file fingerprint. Provider failures and uncertain parse regions produce unknown context. Git mode does not call these adapters.
 
 Tact assembly fingerprints include the header and complete body. Recovery requires verified declaration boundaries. `TactSyntaxRecovery` performs one bounded parse of an in-memory masked copy with lexer-checked boundaries; it never repairs source. Analysis and caches are bounded; provider changes invalidate them and projections through a generation counter.
 
@@ -106,12 +118,14 @@ The shared preceding-guard traversal handles statement order only. Each adapter 
 
 ## Work bounds
 
-These are existing limits, not tuning targets for a refactor:
+Limits apply to separate operations:
 
-- Quadratic matching: 4,000,000 cells per projection/checkpoint workspace, with a 1,000,000-cell limit for an individual diff gap. Exact and linear matching paths remain available after the quadratic allowance is exhausted.
-- Syntax context capture: at most 64 historical snapshots, 10,000,000 characters in total and 2,000,000 characters per snapshot. Excluded snapshots receive unknown context.
+- Non-Git quadratic matching: 4,000,000 cells per projection/checkpoint workspace, with a 1,000,000-cell limit for an individual diff gap. Exact and linear matching paths remain available after the quadratic allowance is exhausted.
+- Non-Git syntax context capture: at most 64 historical snapshots, 10,000,000 characters in total and 2,000,000 characters per snapshot. Excluded snapshots receive unknown context.
 - Context cache: at most 256 entries and 200,000 rows, invalidated on provider changes.
 - Shared artifact reads: 32 MiB per event and 128 MiB per snapshot.
+- Git projection: 8 MiB UTF-8 per input, 32 MiB of diff output and a three-second aggregate deadline across historical snapshots. Current text is written once per operation, mappings are memoized within the workspace, and processes poll cancellation. Failure retains no newly inferred confirmed marks and never falls back to heuristic correspondence.
+- Committed-event membership: 4 MiB of tree output and a three-second deadline. Git subprocesses sanitize inherited `GIT_*` variables and disable optional locks, lazy fetching, prompts and replacement objects.
 - Git version labels: up to 256 commits, 4 MiB of log output, 4 MiB per blob and 16 MiB of blob content in total, within a three-second lookup deadline. Results use the existing 30-second cache.
 
 These bounds cover different operations. The diff allowance does not bound all history scans, PSI work, filesystem I/O or editor painting. See [Development](DEVELOPMENT.md) for performance fixture coverage and [Known issues](KNOWN_ISSUES.md) for verification limits.

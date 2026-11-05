@@ -33,6 +33,7 @@ public final class ReviewHistoryStore extends LegacyReviewHistoryModel implement
         if (shared == null) { if (callback != null) callback.run(); } else shared.whenLoaded(project, path, text, callback);
     }
     void reloadShared(Project project) { if (shared != null) shared.reload(project); }
+    void reconcileShared(Project project) { if (shared != null) shared.reconcile(project); }
     void flushShared(Project project) { if (shared != null) shared.flush(project); }
     void flushShared(Project project, String path) { if (shared != null) shared.flush(project, path); }
     void release(Project project, String path) { if (shared != null) shared.release(project, path); }

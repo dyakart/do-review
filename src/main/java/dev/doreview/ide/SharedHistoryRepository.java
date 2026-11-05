@@ -49,7 +49,7 @@ import static dev.doreview.ide.SharedHistoryMaterializer.topologicalSubset;
 
 /**
  * Worktree-scoped durable history. Portable immutable events are authoritative;
- * SQLite indexes only the event set currently present in this checkout.
+ * a local first-visit basis carries existing review facts across checkout boundaries.
  * All public operations are blocking and must be scheduled outside the EDT.
  */
 public final class SharedHistoryRepository implements AutoCloseable {
@@ -62,6 +62,13 @@ public final class SharedHistoryRepository implements AutoCloseable {
     private final Path database;
     private final Runnable publicationBoundary;
     private Connection connection;
+    private SharedHistoryCheckoutOverlay checkoutOverlay;
+    private String basisCheckout = "";
+    private Set<String> inheritedEvents = Set.of();
+    private Map<String, String> localEventOwners = Map.of();
+    private String membershipFingerprint = "";
+    private Set<String> membershipCandidates = Set.of();
+    private Set<String> headOwnedEvents = Set.of();
     private final Map<Path, Fingerprint> scanned = new HashMap<>();
     private final Map<String, CachedFile> cache = new LinkedHashMap<>(16, .75f, true);
     private String checkoutToken = "";
@@ -138,6 +145,9 @@ public final class SharedHistoryRepository implements AutoCloseable {
                 statement.execute("PRAGMA foreign_keys=ON");
             }
             initialize();
+            checkoutOverlay = new SharedHistoryCheckoutOverlay(connection);
+            transaction(checkoutOverlay::initialize);
+            localEventOwners = checkoutOverlay.owners();
             try (var statement = connection.createStatement()) {
                 statement.execute("PRAGMA journal_mode=WAL");
                 statement.execute("PRAGMA synchronous=FULL");
@@ -182,13 +192,20 @@ public final class SharedHistoryRepository implements AutoCloseable {
         });
     }
 
-    /** Reconciles additions AND removals; a branch switch cannot retain absent events. */
+    /** Reconciles native additions/removals and the immutable, checkout-local inherited basis. */
     public synchronized boolean rescan() {
         requireOpen();
         long started = System.nanoTime(); decodedEventFiles = 0; readSnapshotFiles = 0; indexedEvents = 0;
         try {
             long version = dataVersion();
-            if (version != externalDataVersion) cache.clear();
+            boolean externalChange = version != externalDataVersion;
+            boolean ownersChanged = false;
+            if (externalChange) {
+                cache.clear();
+                var owners = checkoutOverlay.owners();
+                ownersChanged = !owners.equals(localEventOwners);
+                localEventOwners = owners;
+            }
             if (Files.isDirectory(shared)) try (var directories = Files.list(shared)) {
                 if (directories.anyMatch(path -> path.getFileName().toString().matches("v[0-9]+") && !path.getFileName().toString().equals("v1")))
                     throw new IllegalStateException("Unsupported shared review history version; existing files were preserved");
@@ -211,39 +228,55 @@ public final class SharedHistoryRepository implements AutoCloseable {
             }
             CheckoutState checkout = readCheckoutState();
             String branch = checkout.token;
-            // Periodic refreshes inspect metadata only. No JSON decoding, snapshot reads or
-            // full-history SQL queries occur while the portable tree remains unchanged.
+            Set<String> inherited = branch.equals(basisCheckout) ? inheritedEvents : checkoutOverlay.basis(branch);
             Path snapshotRoot = shared.resolve("v1/snapshots");
             var quick = new HashMap<>(metadata);
             for (var old : scanned.entrySet()) if (old.getKey().startsWith(snapshotRoot)) {
                 Path path = old.getKey(); portableFiles.safeSharedPath(path, safeDirectories);
                 quick.put(path, Files.exists(path) ? fingerprint(path, MAX_SNAPSHOT_BYTES, old.getValue().digest()) : new Fingerprint(-1, -1, old.getValue().digest()));
             }
-            if (!eventToken.isEmpty() && quick.equals(scanned) && branch.equals(checkoutToken) && checkout.fingerprint.equals(gitFingerprint)) {
+            if (!externalChange && !eventToken.isEmpty() && quick.equals(scanned) && branch.equals(checkoutToken) && checkout.fingerprint.equals(gitFingerprint)) {
                 externalDataVersion = version;
                 return false;
             }
+            var excluded = excludedOwnedEvents(diskEvents, checkout, inherited);
+            var selectedDisk = new HashSet<>(diskEvents.keySet()); selectedDisk.removeAll(excluded);
             var events = new TreeMap<String, Event>();
+            var parsed = new HashMap<String, Event>();
             var digests = new HashMap<String, String>();
+            var payloads = new HashMap<String, String>();
+            for (String id : inherited) {
+                String payload = indexedPayload(id, null);
+                if (payload == null) {
+                    Path source = portableFiles.eventPath(id);
+                    portableFiles.safeSharedPath(source); fingerprint(source, MAX_EVENT_BYTES, "");
+                    payload = FileSnapshot.normalize(Files.readString(source, StandardCharsets.UTF_8));
+                    payloads.put(id, payload);
+                }
+                Event event = parseEvent(payload);
+                if (!id.equals(event.id)) throw new IllegalStateException("Inherited review event identifier mismatch");
+                events.put(id, event); parsed.put(id, event); digests.put(id, ReviewRepositoryPaths.sha256(payload));
+            }
             var previouslyActive = new HashSet<String>();
             try (var statement = connection.createStatement(); var rows = statement.executeQuery("SELECT id,file_id,path,digest FROM events WHERE active=1")) {
                 while (rows.next()) {
                     String id = rows.getString(1); previouslyActive.add(id);
-                    if (!diskEvents.containsKey(id)) continue;
+                    if (!selectedDisk.contains(id) || events.containsKey(id)) continue;
                     var event = new Event(); event.id = id; event.fileId = rows.getString(2); event.path = rows.getString(3);
                     events.put(id, event); digests.put(id, rows.getString(4));
                 }
             }
             try (var statement = connection.createStatement(); var rows = statement.executeQuery("SELECT d.event_id,d.parent_id FROM dependencies d JOIN events e ON e.id=d.event_id WHERE e.active=1")) {
-                while (rows.next()) { Event event = events.get(rows.getString(1)); if (event != null) event.parents.add(rows.getString(2)); }
+                while (rows.next()) {
+                    String id = rows.getString(1); Event event = events.get(id);
+                    if (event != null && !inherited.contains(id)) event.parents.add(rows.getString(2));
+                }
             }
-            var payloads = new HashMap<String, String>();
-            var parsed = new HashMap<String, Event>();
-            var fingerprints = new HashMap<Path, Fingerprint>();
-            for (var entry : diskEvents.entrySet()) {
-                String id = entry.getKey(); Path path = entry.getValue();
+            var fingerprints = new HashMap<>(metadata);
+            for (String id : selectedDisk) {
+                Path path = diskEvents.get(id);
                 Fingerprint observed = metadata.get(path), old = scanned.get(path);
-                if (events.containsKey(id) && observed.equals(old)) { fingerprints.put(path, observed); continue; }
+                if (events.containsKey(id) && observed.equals(old)) continue;
                 String payload = FileSnapshot.normalize(Files.readString(path, StandardCharsets.UTF_8));
                 decodedEventFiles++;
                 Event event = parseEvent(payload);
@@ -256,23 +289,49 @@ public final class SharedHistoryRepository implements AutoCloseable {
                 parsed.put(id, event); events.put(id, event);
                 fingerprints.put(path, new Fingerprint(observed.size(), observed.modified(), digest));
             }
+            // A foreign local command cannot leak through an uncommitted descendant event either.
+            boolean removed;
+            do {
+                removed = false;
+                for (var iterator = events.entrySet().iterator(); iterator.hasNext();) {
+                    var entry = iterator.next();
+                    if (!inherited.contains(entry.getKey()) && entry.getValue().parents.stream().anyMatch(excluded::contains)) {
+                        excluded.add(entry.getKey()); iterator.remove(); removed = true;
+                    }
+                }
+            } while (removed);
             List<Event> ordered = topological(events);
             var snapshotIds = new TreeSet<String>();
-            try (var statement = connection.createStatement(); var rows = statement.executeQuery("SELECT s.event_id,s.hash FROM event_snapshots s JOIN events e ON e.id=s.event_id WHERE e.active=1")) {
-                while (rows.next()) if (diskEvents.containsKey(rows.getString(1))) snapshotIds.add(rows.getString(2));
+            var requiredSnapshots = new HashSet<String>();
+            try (var statement = connection.createStatement(); var rows = statement.executeQuery("SELECT event_id,hash FROM event_snapshots")) {
+                while (rows.next()) if (events.containsKey(rows.getString(1))) {
+                    snapshotIds.add(rows.getString(2));
+                    if (selectedDisk.contains(rows.getString(1))) requiredSnapshots.add(rows.getString(2));
+                }
             }
-            parsed.values().forEach(event -> snapshotIds.addAll(event.snapshots));
+            for (Event event : parsed.values()) if (events.containsKey(event.id)) {
+                snapshotIds.addAll(event.snapshots);
+                if (selectedDisk.contains(event.id)) requiredSnapshots.addAll(event.snapshots);
+            }
             for (String hash : snapshotIds) {
                 Path path = portableFiles.snapshotPath(hash); portableFiles.safeSharedPath(path, safeDirectories);
+                if (!Files.exists(path) && !requiredSnapshots.contains(hash)) {
+                    if (snapshot(hash) == null) throw new IllegalStateException("Missing inherited review snapshot " + hash);
+                    continue;
+                }
                 Fingerprint observed = fingerprint(path, MAX_SNAPSHOT_BYTES, hash);
                 Fingerprint old = scanned.get(path);
                 if (!observed.equals(old)) { readSnapshotFiles++; new FileSnapshot(hash, Files.readString(path, StandardCharsets.UTF_8)); }
                 fingerprints.put(path, observed);
             }
+            if (!readCheckoutState().equals(checkout)) throw new IllegalStateException("Checkout changed while reading review history");
             String token = ReviewRepositoryPaths.sha256(String.join("\n", events.keySet()));
-            boolean changed = !token.equals(eventToken) || !branch.equals(checkoutToken) || !checkout.fingerprint.equals(gitFingerprint) || !fingerprints.equals(scanned);
+            boolean changed = !token.equals(eventToken) || !branch.equals(checkoutToken) || !checkout.fingerprint.equals(gitFingerprint) || !fingerprints.equals(scanned) || ownersChanged
+                    || !previouslyActive.equals(events.keySet());
             if (changed) {
                 transaction(() -> {
+                    if (!readCheckoutState().equals(checkout)) throw new IllegalStateException("Checkout changed while indexing review history");
+                    checkoutOverlay.remember(branch, inherited);
                     for (String id : previouslyActive) if (!events.containsKey(id)) {
                         try (var update = connection.prepareStatement("UPDATE events SET active=0 WHERE id=?")) { update.setString(1, id); update.executeUpdate(); }
                     }
@@ -282,22 +341,45 @@ public final class SharedHistoryRepository implements AutoCloseable {
                             try (var update = connection.prepareStatement("UPDATE events SET active=1 WHERE id=?")) { update.setString(1, event.id); update.executeUpdate(); }
                         }
                     }
+                    checkoutOverlay.observe(branch);
                 });
                 cache.clear();
                 scanned.clear(); scanned.putAll(fingerprints);
                 eventToken = token;
                 checkoutToken = branch;
                 gitFingerprint = checkout.fingerprint;
+                inheritedEvents = inherited; basisCheckout = branch;
             }
-            externalDataVersion = dataVersion();
+            // Only acknowledge the version whose inputs we inspected. A different
+            // connection may commit while scanning; the next read must reconcile it.
+            externalDataVersion = version;
             return changed;
         } catch (Exception failure) {
             cache.clear();
-            // Do not expose earlier green data while portable history is incomplete or corrupt.
             try { execute("UPDATE events SET active=0"); } catch (SQLException ignored) { }
             scanned.clear(); checkoutToken = "invalid";
             throw problem("Cannot read shared review history", failure);
         } finally { lastScanNanos = System.nanoTime() - started; }
+    }
+
+    private Set<String> excludedOwnedEvents(Map<String, Path> diskEvents, CheckoutState checkout, Set<String> inherited) throws IOException, SQLException {
+        var foreign = new TreeSet<String>();
+        for (String id : diskEvents.keySet()) {
+            String owner = localEventOwners.get(id);
+            if (owner != null && !owner.equals(checkout.token) && !inherited.contains(id)) foreign.add(id);
+        }
+        if (!foreign.isEmpty() && (!membershipFingerprint.equals(checkout.fingerprint) || !membershipCandidates.equals(foreign))) {
+            var payloads = new TreeMap<String, String>();
+            for (String id : foreign) {
+                String payload = indexedPayload(id, null);
+                if (payload == null) payload = FileSnapshot.normalize(Files.readString(diskEvents.get(id), StandardCharsets.UTF_8));
+                payloads.put(id, payload);
+            }
+            headOwnedEvents = SharedHistoryGitMembership.contains(root, payloads);
+            membershipCandidates = Set.copyOf(foreign); membershipFingerprint = checkout.fingerprint;
+        }
+        foreign.removeAll(headOwnedEvents);
+        return foreign;
     }
 
     public synchronized String checkoutToken() { requireOpen(); return checkoutToken; }
@@ -459,6 +541,7 @@ public final class SharedHistoryRepository implements AutoCloseable {
             boolean pathChanged = before != null && !path.equals(before.path);
             if (event.evidence.isEmpty() && event.revocations.isEmpty() && event.checkpoints.isEmpty() && !pathChanged) return existing;
             // References to prior evidence establish causality even if its local revision differs.
+            restoreCausalClosure(event.parents, publicationCheckout);
             Map<String, String> snapshots = after.snapshots;
             PublicationFence fence = publicationFence(event);
             for (String id : event.snapshots) {
@@ -475,6 +558,11 @@ public final class SharedHistoryRepository implements AutoCloseable {
             byte[] payloadBytes = payload.getBytes(StandardCharsets.UTF_8);
             if (payloadBytes.length > MAX_EVENT_BYTES) throw new IllegalArgumentException("Review event exceeds size limit");
             if (!publicationCheckout.equals(readCheckoutState().token)) throw new IllegalStateException("Checkout changed before review publication");
+            // Reserve checkout ownership durably before the event becomes visible. A crash
+            // after linking must never make our command look like an unknown external event.
+            // An unused reservation after failed publication is harmless: UUIDs are immutable.
+            transaction(() -> checkoutOverlay.own(event.id, publicationCheckout));
+            var owners = new HashMap<>(localEventOwners); owners.put(event.id, publicationCheckout); localEventOwners = Map.copyOf(owners);
             Path publishedPath = portableFiles.eventPath(event.id);
             portableFiles.writeImmutable(publishedPath, payloadBytes);
             if (publicationBoundary != null) publicationBoundary.run();
@@ -491,6 +579,40 @@ public final class SharedHistoryRepository implements AutoCloseable {
             if (!ownIndexed) rescan();
             return loadId(fileId, path);
         } catch (Exception failure) { throw problem("Cannot save shared review history", failure); }
+    }
+
+    /** Explicit mutations make their inherited causal parents portable; mere branch visits do not. */
+    private void restoreCausalClosure(List<String> parents, String expectedCheckout) throws SQLException, IOException {
+        var closure = new TreeMap<String, Event>();
+        var payloads = new HashMap<String, String>();
+        var queue = new ArrayList<>(parents);
+        for (int index = 0; index < queue.size(); index++) {
+            String id = queue.get(index);
+            if (closure.containsKey(id)) continue;
+            String payload = indexedPayload(id, null);
+            if (payload == null) throw new IllegalStateException("Missing inherited causal event " + id);
+            Event event = parseEvent(payload); closure.put(id, event); payloads.put(id, payload); queue.addAll(event.parents);
+        }
+        boolean restored = false;
+        for (Event event : topological(closure)) {
+            Path target = portableFiles.eventPath(event.id);
+            if (Files.exists(target)) continue;
+            if (!expectedCheckout.equals(readCheckoutState().token)) throw new IllegalStateException("Checkout changed before inherited review publication");
+            for (String hash : event.snapshots) {
+                Path source = portableFiles.snapshotPath(hash);
+                if (!Files.exists(source)) {
+                    String text = snapshot(hash);
+                    if (text == null) throw new IllegalStateException("Missing inherited review snapshot " + hash);
+                    portableFiles.writeImmutable(source, text.getBytes(StandardCharsets.UTF_8));
+                }
+            }
+            portableFiles.ensureAttributes();
+            portableFiles.writeImmutable(target, payloads.get(event.id).getBytes(StandardCharsets.UTF_8)); restored = true;
+        }
+        if (restored) {
+            rescan();
+            if (!expectedCheckout.equals(checkoutToken)) throw new IllegalStateException("Checkout changed during inherited review publication");
+        }
     }
 
     public synchronized String lastPublishedEventId() { requireOpen(); return lastPublishedEventId; }
@@ -520,12 +642,27 @@ public final class SharedHistoryRepository implements AutoCloseable {
             transaction(() -> {
                 retainOrphanPending(fileId, token);
                 putMissingSnapshots(state.snapshots);
+                if (unchangedPending(fileId, path, pending, author, token)) return;
                 try (var statement = connection.prepareStatement("INSERT INTO pending(file_id,path,checkout_token,writer_id,payload,author) VALUES(?,?,?,?,?,?) ON CONFLICT(file_id,checkout_token,writer_id) DO UPDATE SET path=excluded.path,payload=excluded.payload,author=excluded.author")) {
                     statement.setString(1, fileId); statement.setString(2, path); statement.setString(3, token);
                     statement.setString(4, writerId); statement.setString(5, JSON.toJson(pending)); statement.setString(6, JSON.toJson(author)); statement.executeUpdate();
                 }
             });
         } catch (SQLException failure) { throw problem("Cannot save pending review provenance", failure); }
+    }
+
+    /** Repeated projections must not rewrite durable provenance merely to advance its timestamp. */
+    private boolean unchangedPending(String fileId, String path, PendingState pending, Author author, String token) throws SQLException {
+        try (var query = connection.prepareStatement("SELECT path,payload,author FROM pending WHERE file_id=? AND checkout_token=? AND writer_id=?")) {
+            query.setString(1, fileId); query.setString(2, token); query.setString(3, writerId);
+            try (var rows = query.executeQuery()) {
+                if (!rows.next() || !path.equals(rows.getString(1)) || !author.equals(JSON.fromJson(rows.getString(3), Author.class))) return false;
+                var previous = JSON.fromJson(rows.getString(2), PendingState.class);
+                validatePendingHeader(previous);
+                previous.createdAt = pending.createdAt;
+                return JSON.toJsonTree(previous).equals(JSON.toJsonTree(pending));
+            }
+        }
     }
 
     private void putMissingSnapshots(Map<String, String> snapshots) throws SQLException, IOException {
@@ -777,6 +914,16 @@ public final class SharedHistoryRepository implements AutoCloseable {
         try (var statement = connection.createStatement(); var rows = statement.executeQuery("SELECT 1 FROM pending LIMIT 1")) {
             if (rows.next()) throw new IllegalStateException("Pending provenance must be published before rebuilding the index");
         } catch (SQLException failure) { throw problem("Cannot inspect pending provenance", failure); }
+        try {
+            for (String id : checkoutOverlay.allBasisEvents()) {
+                if (!Files.isRegularFile(portableFiles.eventPath(id), LinkOption.NOFOLLOW_LINKS))
+                    throw new IllegalStateException("Inherited checkout history remains local; restore its source artifacts before rebuilding the index");
+                String payload = indexedPayload(id, null);
+                if (payload == null) throw new IllegalStateException("Missing inherited review history");
+                for (String hash : parseEvent(payload).snapshots) if (!Files.isRegularFile(portableFiles.snapshotPath(hash), LinkOption.NOFOLLOW_LINKS))
+                    throw new IllegalStateException("Inherited checkout snapshots remain local; restore their source artifacts before rebuilding the index");
+            }
+        } catch (SQLException failure) { throw problem("Cannot inspect inherited checkout history", failure); }
         Path destination = database.resolveSibling("history-before-rebuild-" + System.currentTimeMillis() + "-" + UUID.randomUUID() + ".sqlite3");
         backup(destination);
         try {
@@ -923,6 +1070,7 @@ public final class SharedHistoryRepository implements AutoCloseable {
             if (old == null) index(event, payload);
             else if (!old.equals(ReviewRepositoryPaths.sha256(payload))) throw new IllegalStateException("Conflicting immutable review event " + event.id);
             try (var update = connection.prepareStatement("UPDATE events SET active=1 WHERE id=?")) { update.setString(1, event.id); update.executeUpdate(); }
+            checkoutOverlay.observe(checkoutToken);
             indexed[0] = true;
         });
         if (!indexed[0] || !publicationUnchanged(fence)) return false;
@@ -940,7 +1088,7 @@ public final class SharedHistoryRepository implements AutoCloseable {
         }
         eventToken = ReviewRepositoryPaths.sha256(String.join("\n", activeIds));
         checkoutToken = fence.checkout.token; gitFingerprint = fence.checkout.fingerprint;
-        externalDataVersion = dataVersion(); cache.clear(); lastScanNanos = System.nanoTime() - started;
+        externalDataVersion = fence.databaseVersion; cache.clear(); lastScanNanos = System.nanoTime() - started;
         return true;
     }
 

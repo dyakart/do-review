@@ -40,6 +40,9 @@ final class SharedReviewHistoryStore implements Disposable {
     });
     private final Set<Project> initialized = ConcurrentHashMap.newKeySet();
     private final Map<Project, List<String>> warnings = new ConcurrentHashMap<>();
+    private final Object reconciliationLock = new Object();
+    private final Set<Project> reconciliationRequests = new HashSet<>();
+    private boolean reconcileAll, reconciliationQueued;
     private final SharedHistoryLegacyImporter legacyImporter = new SharedHistoryLegacyImporter(
             (project, root) -> session(root, project).repository, this::warn);
     private volatile boolean disposed;
@@ -227,7 +230,8 @@ final class SharedReviewHistoryStore implements Disposable {
         synchronized (view) {
             if (expectedGeneration >= 0 && view.generation != expectedGeneration) return false;
             view.persisted = loaded;
-            if (loaded != null) { view.authors = loaded.evidenceAuthors(); view.observedFrontier = loaded.frontier(); }
+            view.authors = loaded == null ? Map.of() : loaded.evidenceAuthors();
+            view.observedFrontier = loaded == null ? Set.of() : loaded.frontier();
             view.model = model;
             view.retainedBytes = source.snapshots.values().stream().mapToLong(text -> 2L * text.length()).sum();
         }
@@ -278,7 +282,10 @@ final class SharedReviewHistoryStore implements Disposable {
             var waiting = List.copyOf(view.callbacks); view.callbacks.clear();
             whenLoaded(project, view.key.path, view.requestedText, null);
             var replacement = views.get(view.key);
-            if (replacement != null) replacement.callbacks.addAll(waiting);
+            if (replacement != null) {
+                replacement.authors = view.authors;
+                replacement.callbacks.addAll(waiting);
+            }
         }
         updated(project, null, true);
     }
@@ -369,20 +376,66 @@ final class SharedReviewHistoryStore implements Disposable {
         return ReviewHistoryStore.MigrationResult.empty();
     }
     private interface Work { void run() throws Exception; }
-    private void poll() {
-        if (disposed) return;
-        try { worker.execute(() -> {
+    private void poll() { requestReconciliation(null); }
+
+    /** Metadata notifications are hints: keep warm views until their actual history changes. */
+    void reconcile(Project project) { requestReconciliation(project); }
+
+    private void requestReconciliation(Project project) {
+        synchronized (reconciliationLock) {
+            if (disposed) return;
+            if (project == null) reconcileAll = true;
+            else reconciliationRequests.add(project);
+            scheduleReconciliation();
+        }
+    }
+
+    /** The lock protects only scheduling; filesystem and SQL work always stay on the worker. */
+    private void scheduleReconciliation() {
+        if (reconciliationQueued || disposed) return;
+        reconciliationQueued = true;
+        try { worker.execute(this::reconcileOnWorker); }
+        catch (java.util.concurrent.RejectedExecutionException closed) { reconciliationQueued = false; }
+    }
+
+    private void reconcileOnWorker() {
+        Set<Project> requestedProjects;
+        boolean all;
+        synchronized (reconciliationLock) {
+            all = reconcileAll; requestedProjects = Set.copyOf(reconciliationRequests);
+            reconcileAll = false; reconciliationRequests.clear();
+        }
+        try {
             var changedProjects = new HashSet<Project>();
             for (var entry : sessions.entrySet()) {
+                if (!all && !requestedProjects.contains(entry.getKey().project)) continue;
                 try {
-                    if (entry.getValue().repository.rescan()) changedProjects.add(entry.getKey().project);
+                    var session = entry.getValue();
+                    if (session.repository.rescan() && visibleHistoryChanged(session)) changedProjects.add(entry.getKey().project);
                 } catch (RuntimeException failure) {
                     var project = entry.getKey().project;
                     warn(project, "Shared review history is incomplete or unreadable; confirmed marks are hidden."); changedProjects.add(project);
                 }
             }
             for (var project : changedProjects) deliver(project, () -> reload(project));
-        }); } catch (java.util.concurrent.RejectedExecutionException closed) { }
+        } finally {
+            synchronized (reconciliationLock) {
+                reconciliationQueued = false;
+                if (reconcileAll || !reconciliationRequests.isEmpty()) scheduleReconciliation();
+            }
+        }
+    }
+    /** Git commits and metadata timestamps can change without replacing any visible review history. */
+    private boolean visibleHistoryChanged(Session session) {
+        for (var view : views.values()) {
+            if (view.session != session || view.model == null) continue;
+            if (view.failed || !view.token.equals(session.repository.checkoutToken())) return true;
+            var current = session.repository.load(view.repoPath);
+            var installed = view.persisted;
+            if (current == null ? installed != null : installed == null
+                    || !current.fileId().equals(installed.fileId()) || !current.frontier().equals(installed.frontier())) return true;
+        }
+        return false;
     }
     void projectClosed(Project project) {
         flush(project);

@@ -1,6 +1,48 @@
 # Known issues
 
-This file records existing behavior found during structural refactoring. The refactor preserves these behaviors; it does not include functional fixes. Issue identifiers below are local documentation references, not tracker tickets.
+This file records existing defects, verification limits and the status of follow-up functional fixes. The structural refactor at `ed7cebd` preserved behavior; the subsequent Git/checkout fixes intentionally change the behavior described below. Issue identifiers are local documentation references, not tracker tickets.
+
+## Addressed Git and refresh problems
+
+### DOR-004: context heuristics invalidate lines outside Git changes
+
+**Status:** addressed; verified with actual Git subprocesses and physical IDE fixtures. A manually installed IDE session has not been exercised.
+
+**Location:** `ReviewProjectionComputer`, `ReviewGitDiff`, and the Git paths in `DoReviewService`.
+
+**Conditions and impact:** a reviewed function header changes, an unsupported-language file changes anywhere, or an old origin checkpoint carries an ambiguous match. Syntax/whole-file fingerprints previously made unchanged rows require review. Git repositories now use zero-context Git hunks against the reviewed snapshot and current document, including unsaved text. Legacy heuristic constraints do not override Git correspondence. Explicit clears still revoke evidence.
+
+**Verification:** `ReviewGitDiffTest`, `ReviewGitProjectionTest`, and Git edit/Undo/Redo/pull cases in `DoReviewServiceTest`. Duplicate rows follow Git's selected alignment; this is a deliberate change from persistent local-origin heuristics. Non-Git context behavior remains covered separately.
+
+### DOR-005: carried local events mix branch review state
+
+**Status:** addressed; real Git checkout, restart and linked-worktree regressions cover the local overlay.
+
+**Location:** `SharedHistoryRepository`, `SharedHistoryCheckoutOverlay`, `SharedHistoryGitMembership`.
+
+**Conditions and impact:** untracked `.doreview` files survive checkout, while tracked history may disappear in the destination branch. Previously the working-tree file set either leaked later branch operations or removed useful starting evidence. First visits now inherit a frozen local basis; branch-owned later operations remain isolated unless deliberately committed in the destination. Returning to an existing branch reuses its basis. Same-branch deletion/reset of native events remains effective.
+
+**Verification:** `SharedHistoryCheckoutTest` exercises return/restart, missing artifacts, explicit inherited mutations, intentional committed sharing, failed first visits, publication interruption, SQL ownership failure and two-connection reconciliation. Ownership is durable before JSON publication; externally replaced SQL active sets cannot bypass reconciliation using stale filesystem metadata. `SharedReviewHistoryStoreTest` also covers the complete editor path across changed branch source and explicit revocations. `SharedHistoryGitMembershipTest` verifies exact blob identity. Existing events without recorded local ownership remain accepted as shared external history; the fix cannot infer which branch created pre-existing untracked files. Deleted local databases cannot recover unpublished branch bases from portable files alone.
+
+### DOR-006: metadata refresh repeatedly clears valid presentation
+
+**Status:** addressed by background reconciliation and stable presentation; automated editor-resource regressions pass.
+
+**Location:** `SharedReviewHistoryStore`, `DoReviewService`, `ReviewEditorPresentation`, `ReviewStripePresentation`.
+
+**Conditions and impact:** periodic scans, own publications or `.git`/`.doreview` notifications previously replaced all views and cleared confirmed highlights before recomputation. No-op changes now retain warmed models, highlighters and stripe snapshots. Additive refresh keeps still-supported marks visible while computation runs. Real edits, removals, revocations and unreadable history still invalidate affected marks.
+
+**Verification:** `ReviewBackgroundRefreshTest` checks repeated notifications, metadata hints, blocked loading/capture, author metadata, explicit incoming revocation and synchronous clearing before text changes. Synthetic checks establish resource reuse, not a real-project latency guarantee.
+
+### DOR-007: immutable publication can replace a racing writer
+
+**Status:** addressed; deterministic concurrent tests reproduce the collision boundary and verify no replacement.
+
+**Location:** `SharedHistoryFiles.writeImmutable`, `SharedHistoryRepository.savePending`.
+
+**Conditions and impact:** two writers publish different bytes at the same final path after both observed it absent. POSIX atomic rename permits replacing an existing target. Publication now uses atomic hard-link creation, compares an existing winner and rejects conflicting bytes. Unsupported filesystems preserve pending work instead of publishing partial files. Snapshot identities remain content-addressed; event IDs remain UUIDs.
+
+**Verification:** `SharedHistoryFilesTest` races identical and conflicting publishers. `SharedHistoryCheckoutTest.testIdenticalPendingStateDoesNotRewriteItsTimestampOrSnapshot` uses SQL triggers and exact payload comparison to check deduplication. Pure Git projection no longer emits checkpoint events or edit snapshots; explicit marks and clears still retain their evidence and causal parents.
 
 ## Confirmed defects
 
@@ -33,11 +75,11 @@ GIT_DIR="$scratch/b/.git" git -C "$scratch/a" config --get user.email
 # b@example.invalid
 ```
 
-The same command returns Author A after removing the inherited repository-selection variables, as the version-label lookup does. Remove the temporary directory after the check. A future fix should independently test worktree-specific author lookup in a controlled environment. It is deliberately outside this refactor.
+The same command returns Author A after removing the inherited repository-selection variables, as the version-label, Git diff and committed-event lookups do. Remove the temporary directory after the check. A future fix should independently test worktree-specific author lookup in a controlled environment. Author lookup is outside the requested Git projection/checkout fixes.
 
 ## Unconfirmed hypotheses
 
-No additional unconfirmed findings are currently recorded. Splitting responsibilities and removing duplicated code are refactoring changes, not evidence of a user-visible bug.
+No additional unconfirmed defects are currently recorded. Manual IDE latency and optional CodeGlance compatibility remain verification limits below.
 
 ## Baseline test and environment findings
 
@@ -63,7 +105,7 @@ These failures were reproduced on the unchanged baseline on macOS ARM64 with Jav
 
 **Observed result:** the loaded action's shortcut set does not contain the test's expected `KeyboardShortcut(ctrl M)`, so the assertion fails. The cause and any effect of macOS keymap selection need a separate investigation. This result alone does not establish which shortcut works in a running IDE. The keymap registration and test expectation remain unchanged.
 
-## Verification limits
+## Structural-refactor baseline
 
 Validation on 2026-11-03 used macOS ARM64, Temurin 25.0.5 and the pinned PyCharm 2026.2.3 SDK. The unchanged baseline at `7188ef6` ran 362 JUnit tests: 360 passed and the two tests described in DOR-002/DOR-003 failed. The refactored tree ran 364: 362 passed, with exactly the same two failures and no removed tests. Both added compatibility tests also passed separately against the baseline production classes.
 
@@ -71,4 +113,10 @@ The four standalone core suites passed all 9,617 checks before and after refacto
 
 The regular suite does not include tests against the actual CodeGlance plugin unless `codeGlancePluginPath` points to a compatible installation. The source-corpus audit similarly needs an explicit `reviewCorpus` directory. An omitted optional suite is not a passing result.
 
-See [Development](DEVELOPMENT.md) for the full build command, isolated test-data paths and focused test suites. Synthetic performance fixtures check output and bounds; their timings do not establish real-project latency or retained-memory guarantees.
+## Follow-up validation and limits
+
+Validation on 2026-11-05 used the same isolated Java 25/PyCharm 2026.2.3 environment. The final suite ran 407 JUnit tests: 405 passed, with exactly the same DOR-002/DOR-003 failures, zero errors and zero skipped tests. All 9,617 standalone core checks passed. Core isolation compilation, `buildPlugin` and `verifyPluginStructure` passed; the overall `check` command remains unsuccessful because of those two baseline failures. No tests were removed. Git-specific expectations about writing edit checkpoints and applying old heuristic origin denials were intentionally replaced by the requested Git behavior; non-Git migration-denial assertions remain covered unchanged.
+
+See [Development](DEVELOPMENT.md) for the full build command, isolated test-data paths and focused test suites. Synthetic performance fixtures check output and bounds; their timings do not establish real-project latency or retained-memory guarantees. A compatible local CodeGlance plugin and a source corpus were unavailable, so those optional checks were not run.
+
+Git projection has bounded input/output and a three-second aggregate process deadline. If Git is unavailable, input exceeds these limits or computation fails, saved evidence remains intact and newly inferred marks are withheld. Existing exact-snapshot facts can remain confirmed. Git executable availability and filesystem hard-link support are runtime requirements.

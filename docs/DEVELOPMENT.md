@@ -6,7 +6,7 @@ Use Java 25 and the Gradle wrapper included in the repository. The default build
 
 The wrapper pins Gradle 9.2.1 and its distribution checksum. A first build needs network access to the Gradle, Maven and JetBrains repositories, plus space for the IDE distribution and test sandbox. Compilation and the IDE test runtime must both use Java 25.
 
-Install Git and make `git` available on `PATH`. The regular test suite creates disposable repositories and exercises commits, checkouts and linked worktrees.
+Install Git and make `git` available on `PATH` for both development and the IDE runtime. The regular test suite creates disposable repositories and exercises commits, checkouts and linked worktrees. Shared publication requires hard links within the repository filesystem; unsupported filesystems retain pending work and report the error rather than copying a partially visible event.
 
 On macOS or Linux, a downloaded JDK can be used for one invocation without changing system settings:
 
@@ -64,6 +64,9 @@ The Windows helper forwards Gradle arguments through `-Tasks`, for example `.\bu
 - **Core models and bounds:** `BlankReviewTest`, `ReviewHistoryIndexTest` and `ReviewHistoryPerformanceTest` exercise nonblank evidence, indexes, cache reuse and work budgets through JUnit.
 - **Storage compatibility:** `ReviewHistoryStoreTest` and `CheckpointTransferTest` cover legacy state, checkpoints, validation and defensive copies. `SharedHistoryRepositoryTest` covers portable artifacts, pending durability, concurrent writers, publication races, corrupt/future formats and WAL backup.
 - **Shared IDE history:** `SharedReviewHistoryStoreTest` exercises the production facade, migration, editor lifecycle, nested repository roots and checkout changes. `SharedHistoryGitWorkflowTest` covers independent clones, linked worktrees and concurrent review/revocation.
+- **Git correspondence:** `ReviewGitDiffTest` runs real Git for insertions, deletions, duplicate rows, line endings, configured algorithms, process limits, cancellation and temporary-file ownership. `ReviewGitProjectionTest` verifies unsaved input, explicit revocations, ignored legacy heuristic constraints and the absence of PSI calls in Git mode. `SharedHistoryGitMembershipTest` validates exact committed payloads/paths, foreign branches and SHA-256 Git repositories.
+- **Background refresh and collisions:** `ReviewBackgroundRefreshTest` covers no-op notifications, additive history refresh, metadata hints and synchronous clearing on real edits. `SharedHistoryFilesTest` races identical and conflicting immutable publishers and verifies that the winner's bytes are preserved.
+- **Branch isolation:** `SharedHistoryCheckoutTest` covers branch bases, restarts, native deletions, failed first visits, owner-reservation failures and two-connection SQLite reconciliation. `SharedReviewHistoryStoreTest.testGitBranchInheritsUnchangedLinesAndRestoresEachBranchesExplicitRevocations` exercises the complete editor/storage path across source changes, clears and coordinator restarts.
 - **Projection lifecycle:** service, scheduler and projection-computer suites cover edit ordering, stale delivery, frozen clear commands, cancellation and disposal. Context suites cover adapter replacement, fingerprints, guard boundaries and syntax recovery.
 - **Presentation and metadata:** stripe, authors, shortcuts, widget and metadata suites protect rendering, split-editor ownership, navigation and installed plugin identities. CodeGlance has its separate optional suite below.
 
@@ -79,7 +82,9 @@ Keep the public facades and serialized state beans stable. Internal helpers belo
 
 When changing a subsystem, record the original test results first, run its focused checks after the change, then run the complete build command. Existing failing behavior belongs in [Known issues](KNOWN_ISSUES.md); do not silently fix it or weaken test expectations as part of structural cleanup. Add regression tests for uncovered observable boundaries, rather than for the fact that a facade delegates to a helper.
 
-Core changes must retain the `java.base` boundary and matching order. Context extensions must return immutable context maps and keep PSI inside the read phase. Storage helpers must not acquire independent connections or workers: transaction boundaries, checkout fences and publication ordering remain owned by their facades. Presentation changes must preserve EDT ownership and release resources with their existing `Disposable` owner.
+Core changes must retain the `java.base` boundary and matching order. External line matchers enter through an operation-local workspace function; they must return exact complete-row correspondence and remain outside read actions. Git process sessions belong to one projection and must close on success, failure and cancellation. Do not add a cross-operation mapping cache without including every Git diff configuration input in its identity.
+
+Context extensions must return immutable context maps and keep PSI inside the read phase; Git files bypass them. Storage helpers must not acquire independent connections or workers: transaction boundaries, checkout fences and publication ordering remain owned by their facades. Local checkout metadata must never change portable event identities or resurrect native events removed by a same-branch reset. Presentation changes must preserve EDT ownership, retain valid highlights across metadata-only refreshes and release resources with their existing `Disposable` owner.
 
 Validate compatibility by reading pre-change event/checkpoint fixtures and checking the emitted fields, snapshot hashes and checksums. Preserve explicit revocations and ambiguous origin constraints across save/reload, edits and branch round trips. Do not change formats or bump dependency versions to make a refactor build.
 

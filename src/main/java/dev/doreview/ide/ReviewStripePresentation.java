@@ -54,13 +54,18 @@ final class ReviewStripePresentation implements Disposable {
         editors.add(editor);
         var document = editor.getDocument();
         var cached = snapshots.get(document);
-        if (cached == null || cached.projection != projection || cached.stamp != document.getModificationStamp()) {
+        if (cached == null || !sameContent(cached.projection, projection) || cached.stamp != document.getModificationStamp()) {
             scheduler.cancel(document);
             clearPanels(document);
             cached = new Cached(projection, document.getModificationStamp());
             snapshots.put(document, cached);
         }
         if (ReviewStripeSettings.getInstance(project).isShown()) show(editor, cached);
+    }
+
+    private static boolean sameContent(FileProjection first, FileProjection second) {
+        return first == second || first.currentSnapshotId().equals(second.currentSnapshotId())
+                && first.rows().equals(second.rows()) && first.deletions().equals(second.deletions());
     }
 
     private void show(Editor editor, Cached cached) {
