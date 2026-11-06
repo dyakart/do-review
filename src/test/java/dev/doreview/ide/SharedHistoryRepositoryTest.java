@@ -8,6 +8,7 @@ import dev.doreview.core.ReviewHistoryEngine;
 import dev.doreview.core.ReviewedRange;
 import junit.framework.TestCase;
 import com.google.gson.Gson;
+import com.google.gson.JsonParser;
 
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -74,6 +75,62 @@ public final class SharedHistoryRepositoryTest extends TestCase {
         try (var repository = new SharedHistoryRepository(clone, temporary.resolve("clone-local/history.sqlite3"))) {
             assertEquals(1, repository.load("a.txt").state().evidence.size());
             assertEquals(ALICE, repository.load("a.txt").evidenceAuthors().values().iterator().next());
+        }
+    }
+
+    public void testFixedV1EventRemainsReadableAndNewEventsKeepItsPortableFields() throws Exception {
+        String eventId = "11111111-1111-1111-1111-111111111111";
+        String hash = "2c8b08da5ce60398e1f19af0e5dccc744df274b826abe585eaba68c525434806";
+        // Fixed pre-refactor v1 wire data: no current encoder constructs the input fixture.
+        String payload = """
+                {"version":1,"id":"11111111-1111-1111-1111-111111111111",
+                 "fileId":"fixture-file","path":"a.txt","aliases":["a.txt"],
+                 "authorName":"Alice","authorEmail":"alice@example.test","createdAt":1,
+                 "parents":[],"evidence":[{"id":"fixture-proof",
+                 "snapshotId":"2c8b08da5ce60398e1f19af0e5dccc744df274b826abe585eaba68c525434806",
+                 "ranges":[{"start":0,"end":4}],"createdAt":1}],
+                 "revocations":[],"checkpoints":{},
+                 "snapshots":["2c8b08da5ce60398e1f19af0e5dccc744df274b826abe585eaba68c525434806"]}
+                """;
+        Path event = root.resolve(".doreview/v1/events/11/" + eventId + ".json");
+        Path snapshot = root.resolve(".doreview/v1/snapshots/2c/" + hash + ".txt");
+        Files.createDirectories(event.getParent()); Files.createDirectories(snapshot.getParent());
+        Files.writeString(event, payload, StandardCharsets.UTF_8);
+        Files.writeString(snapshot, "one\n", StandardCharsets.UTF_8);
+
+        try (var repository = new SharedHistoryRepository(root, database)) {
+            var original = repository.load("a.txt");
+            assertEquals("fixture-file", original.fileId());
+            assertEquals(Set.of(eventId), original.frontier());
+            assertEquals(ALICE, original.evidenceAuthors().get("fixture-proof"));
+            assertEquals("one\n", repository.snapshot(hash));
+            assertEquals(1, original.state().evidence.getFirst().sequence);
+
+            var next = SharedHistoryRepository.copyFile(original.state());
+            var history = ReviewHistoryEngine.review(ReviewJournalCodec.read(next), "one\n",
+                    List.of(new ReviewedRange(0, 4)), 2);
+            history = ReviewHistoryEngine.revoke(history, List.of(new EvidenceRef("fixture-proof", 0, 4)));
+            ReviewJournalCodec.write(next, history);
+            var published = repository.publish(original.fileId(), "a.txt", original.state(), next, BOB);
+
+            Path emitted = eventFiles(root).stream().filter(path -> !path.equals(event)).findFirst().orElseThrow();
+            var json = JsonParser.parseString(Files.readString(emitted)).getAsJsonObject();
+            assertEquals(Set.of("version", "id", "fileId", "path", "aliases", "authorName", "authorEmail",
+                    "createdAt", "parents", "evidence", "revocations", "checkpoints", "snapshots"), json.keySet());
+            assertEquals(1, json.get("version").getAsInt());
+            assertEquals(eventId, json.getAsJsonArray("parents").get(0).getAsString());
+            var proof = json.getAsJsonArray("evidence").get(0).getAsJsonObject();
+            assertEquals(Set.of("id", "snapshotId", "ranges", "createdAt"), proof.keySet());
+            assertEquals(hash, proof.get("snapshotId").getAsString());
+            assertEquals(2, proof.get("createdAt").getAsLong());
+            var revocation = json.getAsJsonArray("revocations").get(0).getAsJsonObject();
+            assertEquals(Set.of("evidenceId", "ranges"), revocation.keySet());
+            assertEquals("fixture-proof", revocation.get("evidenceId").getAsString());
+            assertEquals(hash, json.getAsJsonArray("snapshots").get(0).getAsString());
+            assertEquals(2, published.state().evidence.size());
+            assertEquals(1, published.state().revocations.size());
+            assertEquals("one\n", Files.readString(snapshot));
+            assertEquals(payload, Files.readString(event));
         }
     }
 

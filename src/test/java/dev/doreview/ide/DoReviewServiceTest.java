@@ -452,16 +452,14 @@ public final class DoReviewServiceTest extends BasePlatformTestCase {
         Document doc = open("sample.py", baseline);
         initGit(); markAll(doc);
         ReviewHistory original = service.history(doc);
-        var target = service.projection(doc).rows().get(2).revocableRefs().getFirst();
+        var initialCheckpoints = store.getState().projects.values().iterator().next().files.values().iterator().next().checkpoints;
 
         edit(doc, () -> replace(doc, "LP exchange request pending", "Temporary diagnostic"));
         assertEquals(FileProjection.Status.CHANGED, service.projection(doc).rows().get(2).status());
         assertEquals(FileProjection.Reason.TEXT_CHANGED, service.projection(doc).rows().get(2).reason());
         var savedFile = store.getState().projects.values().iterator().next().files.values().iterator().next();
-        assertTrue("The temporary edit must leave a historical positive row locator",
-                savedFile.checkpoints.values().stream().flatMap(checkpoint -> checkpoint.payload.refs.stream())
-                        .anyMatch(ref -> ref.evidenceId.equals(target.evidenceId()) && ref.start == target.baselineStart()
-                                && ref.end == target.baselineEnd() && ref.authoritative && ref.live != null));
+        assertEquals("Git reconstructs correspondence without writing edit checkpoints",
+                initialCheckpoints, savedFile.checkpoints);
         edit(doc, () -> replace(doc, "Temporary diagnostic", "LP exchange request pending"));
         assertEquals(FileProjection.Status.REVIEWED, service.projection(doc).rows().get(2).status());
         FileDocumentManager.getInstance().saveDocument(doc);

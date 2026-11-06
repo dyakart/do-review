@@ -31,6 +31,7 @@ import com.intellij.openapi.vfs.newvfs.events.VFileMoveEvent;
 import com.intellij.openapi.vfs.newvfs.events.VFilePropertyChangeEvent;
 import com.intellij.util.messages.Topic;
 import dev.doreview.core.ContextMap;
+import dev.doreview.core.EvidenceRef;
 import dev.doreview.core.FileProjection;
 import dev.doreview.core.FileSnapshot;
 import dev.doreview.core.ProjectionHints;
@@ -46,8 +47,10 @@ import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
+import java.nio.file.Path;
 
 /** Saved facts are immutable; editor projections are disposable and UI-thread confined. */
 @Service(Service.Level.PROJECT)
@@ -97,56 +100,88 @@ public final class DoReviewService implements Disposable {
         var migration = store.importLegacyFromProject(project);
         if (!migration.warnings().isEmpty()) notifyInfo(String.join("\n", migration.warnings()));
         var factory = EditorFactory.getInstance();
+        registerDocumentListener(factory);
+        registerEditorListener(factory);
+        registerApplicationListeners();
+        registerContextListener();
+        registerSaveListener();
+        registerVfsListener();
+        refreshAll();
+    }
+
+    private void registerDocumentListener(EditorFactory factory) {
         factory.getEventMulticaster().addDocumentListener(new DocumentListener() {
             @Override public void beforeDocumentChange(@NotNull DocumentEvent event) {
-                if (!supports(event.getDocument())) return;
-                if (event.getOldFragment().toString().contentEquals(event.getNewFragment())) return;
-                var previous = projection(event.getDocument());
-                var state = runtime.get(event.getDocument());
-                if (state.ready) state.hints = state.hints.mergeResolved(ProjectionHints.fromProjection(history(event.getDocument()), previous));
-                else {
-                    // Seed newly marked exact facts without dropping earlier coordinate evidence
-                    // while a worker is still resolving other historical snapshots.
-                    var seed = ProjectionHints.fromProjection(exactHistory(history(event.getDocument()), event.getDocument().getText()), previous);
-                    state.hints = state.hints.mergeResolved(seed);
-                }
-                // Range highlighters expand with inserted text. Remove confirmed tint before
-                // the edit so newly inserted code cannot appear green while analysis is pending.
-                presentation.clearConfirmed(event.getDocument());
+                beforeDocumentEdit(event);
             }
             @Override public void documentChanged(@NotNull DocumentEvent event) {
-                var document = event.getDocument();
-                if (!supports(document) || event.getOldFragment().toString().contentEquals(event.getNewFragment())) return;
-                var state = runtime.get(document);
-                if (state != null) {
-                    String previousText = state.text;
-                    state.hints = event.isWholeTextReplaced() ? savedHints(document)
-                            : state.hints.applyEdit(state.text, document.getText(), event.getOffset(), event.getOldLength(), event.getNewLength());
-                    if (!state.ready && !event.isWholeTextReplaced()) {
-                        state.hints = state.hints.guardUnresolvedEdit(history(document), previousText, document.getText(),
-                                event.getOffset(), event.getOldLength(), event.getNewLength());
-                    }
-                    state.stamp = -1;
-                    savePendingHints(document, state.hints);
-                }
-                refreshDocument(document);
+                afterDocumentEdit(event);
             }
         }, this);
+    }
+
+    private void beforeDocumentEdit(DocumentEvent event) {
+        if (!supports(event.getDocument())) return;
+        if (event.getOldFragment().toString().contentEquals(event.getNewFragment())) return;
+        var previous = projection(event.getDocument());
+        var state = runtime.get(event.getDocument());
+        state.retainPresentation = false;
+        state.stablePresentation = false;
+        if (isGitDocument(event.getDocument())) state.hints = ProjectionHints.empty();
+        else if (state.ready) state.hints = state.hints.mergeResolved(ProjectionHints.fromProjection(history(event.getDocument()), previous));
+        else {
+            // Seed newly marked exact facts without dropping earlier coordinate evidence
+            // while a worker is still resolving other historical snapshots.
+            var seed = ProjectionHints.fromProjection(exactHistory(history(event.getDocument()), event.getDocument().getText()), previous);
+            state.hints = state.hints.mergeResolved(seed);
+        }
+        // Range highlighters expand with inserted text. Remove confirmed tint before
+        // the edit so newly inserted code cannot appear green while analysis is pending.
+        presentation.clearConfirmed(event.getDocument());
+    }
+
+    private void afterDocumentEdit(DocumentEvent event) {
+        var document = event.getDocument();
+        if (!supports(document) || event.getOldFragment().toString().contentEquals(event.getNewFragment())) return;
+        var state = runtime.get(document);
+        if (state != null) {
+            String previousText = state.text;
+            boolean git = isGitDocument(document);
+            state.hints = git ? ProjectionHints.empty() : event.isWholeTextReplaced() ? savedHints(document)
+                    : state.hints.applyEdit(state.text, document.getText(), event.getOffset(), event.getOldLength(), event.getNewLength());
+            if (!git && !state.ready && !event.isWholeTextReplaced()) {
+                state.hints = state.hints.guardUnresolvedEdit(history(document), previousText, document.getText(),
+                        event.getOffset(), event.getOldLength(), event.getNewLength());
+            }
+            state.stamp = -1;
+            savePendingHints(document, state.hints);
+        }
+        refreshDocument(document);
+    }
+
+    private void registerEditorListener(EditorFactory factory) {
         factory.addEditorFactoryListener(new EditorFactoryListener() {
             @Override public void editorCreated(@NotNull EditorFactoryEvent event) {
                 if (event.getEditor().getProject() == project) refreshDocument(event.getEditor().getDocument());
             }
             @Override public void editorReleased(@NotNull EditorFactoryEvent event) {
-                presentation.release(event.getEditor());
-                if (Arrays.stream(factory.getEditors(event.getEditor().getDocument(), project))
-                        .noneMatch(editor -> editor != event.getEditor() && !editor.isDisposed())) {
-                    scheduler.cancel(event.getEditor().getDocument());
-                    runtime.remove(event.getEditor().getDocument());
-                    String key = keyFor(event.getEditor().getDocument());
-                    if (key != null) store.release(project, key);
-                }
+                releaseEditor(event.getEditor(), factory);
             }
         }, this);
+    }
+
+    private void releaseEditor(Editor released, EditorFactory factory) {
+        presentation.release(released);
+        if (Arrays.stream(factory.getEditors(released.getDocument(), project))
+                .noneMatch(editor -> editor != released && !editor.isDisposed())) {
+            scheduler.cancel(released.getDocument());
+            runtime.remove(released.getDocument());
+            String key = keyFor(released.getDocument());
+            if (key != null) store.release(project, key);
+        }
+    }
+
+    private void registerApplicationListeners() {
         ApplicationManager.getApplication().getMessageBus().connect(this).subscribe(EditorColorsManager.TOPIC, scheme -> refreshAll());
         ApplicationManager.getApplication().getMessageBus().connect(this).subscribe(ReviewHistoryStore.TOPIC, () -> {
             storeEpoch.incrementAndGet();
@@ -156,69 +191,153 @@ public final class DoReviewService implements Disposable {
         ApplicationManager.getApplication().getMessageBus().connect(this).subscribe(ReviewHistoryStore.SHARED_UPDATES,
                 (owner, path, replacement) -> {
                     if (owner != project) return;
-                    Runnable update = () -> {
-                        if (replacement) { storeEpoch.incrementAndGet(); historyReloaded(); return; }
-                        for (var document : List.copyOf(runtime.keySet())) {
-                            if (path != null && !path.equals(keyFor(document))) continue;
-                            scheduler.cancel(document);
-                            var state = runtime.get(document);
-                            state.stamp = -1;
-                            state.ready = false;
-                            state.hints = savedHints(document);
-                            presentation.clearConfirmed(document);
-                        }
-                        reportStorageWarnings();
-                        refreshAll();
-                    };
+                    Runnable update = () -> sharedHistoryUpdated(path, replacement);
                     if (ApplicationManager.getApplication().isDispatchThread()) update.run();
                     else ApplicationManager.getApplication().invokeLater(update, project.getDisposed());
                 });
+    }
+
+    private void sharedHistoryUpdated(String path, boolean replacement) {
+        for (var document : List.copyOf(runtime.keySet())) {
+            if (path != null && !path.equals(keyFor(document))) continue;
+            refreshSharedHistory(document);
+        }
+        reportStorageWarnings();
+        refreshAll();
+    }
+
+    private void refreshSharedHistory(Document document) {
+        var state = runtime.get(document);
+        String key = keyFor(document);
+        if (state == null || key == null) return;
+        if (!store.isLoaded(project, key)) {
+            // A background reload may temporarily have no replacement model. Keep a valid
+            // immutable view until loading completes; unreadable history must fail closed.
+            if (store.diagnostics(project).isEmpty()) return;
+            scheduler.cancel(document);
+            state.stamp = -1;
+            state.ready = false;
+            state.retainPresentation = false;
+            state.stablePresentation = false;
+            presentation.clearConfirmed(document);
+            return;
+        }
+        var history = store.history(project, key);
+        var checkpoint = savedHints(document);
+        String checkout = store.checkoutToken(project, key);
+        boolean sameFacts = sameHistoryFacts(state.history, history);
+        boolean sameCheckpoint = checkpoint.equals(state.persistedHints);
+        boolean sameCheckout = Objects.equals(checkout, state.checkout);
+        if (sameFacts && sameCheckpoint && sameCheckout && (state.ready || state.history == history)) {
+            state.history = history;
+            state.revision = history.revision();
+            if (state.projection != null && state.projection.historyRevision() != history.revision()) {
+                var prior = state.projection;
+                state.projection = new FileProjection(prior.currentSnapshotId(), history.revision(), prior.rows(),
+                        prior.reviewedRanges(), prior.yellowRanges(), prior.changedRanges(), prior.deletions());
+            }
+            return;
+        }
+        boolean retain = state.stablePresentation && state.presentationStamp == document.getModificationStamp()
+                && state.contextGeneration == contextGeneration(document)
+                && state.text.equals(document.getText()) && sameCheckpoint && (sameCheckout || isGitDocument(document))
+                && retainsReviewedFacts(state.presentationHistory, history);
+        scheduler.cancel(document);
+        state.stamp = -1;
+        state.ready = false;
+        state.retainPresentation = retain;
+        state.hints = checkpoint;
+        state.persistedHints = checkpoint;
+        state.checkout = checkout;
+        if (!retain) { state.stablePresentation = false; presentation.clearConfirmed(document); }
+    }
+
+    private static boolean sameHistoryFacts(ReviewHistory previous, ReviewHistory current) {
+        return previous != null && previous.snapshots().equals(current.snapshots())
+                && previous.evidence().equals(current.evidence()) && previous.revocations().equals(current.revocations());
+    }
+
+    private static boolean retainsReviewedFacts(ReviewHistory previous, ReviewHistory current) {
+        return previous != null && current.snapshots().entrySet().containsAll(previous.snapshots().entrySet())
+                && current.evidence().containsAll(previous.evidence()) && current.revocations().equals(previous.revocations());
+    }
+
+    private void registerContextListener() {
         project.getMessageBus().connect(this).subscribe(ContextAnalysisManager.CHANGED, this::contextChanged);
+    }
+
+    private void registerSaveListener() {
         ApplicationManager.getApplication().getMessageBus().connect(this).subscribe(AppTopics.FILE_DOCUMENT_SYNC, new FileDocumentManagerListener() {
             @Override public void beforeDocumentSaving(@NotNull Document document) {
                 String key = keyFor(document);
                 if (key != null) store.flushShared(project, key);
             }
         });
+    }
+
+    private void registerVfsListener() {
         project.getMessageBus().connect(this).subscribe(VirtualFileManager.VFS_CHANGES, new BulkFileListener() {
-            @Override public void before(@NotNull List<? extends VFileEvent> events) {
-                if (!store.isShared() || events.stream().noneMatch(DoReviewService::historyEvent)) return;
-                storeEpoch.incrementAndGet();
-                scheduler.cancelProjections();
-                for (var document : List.copyOf(runtime.keySet())) presentation.clearConfirmed(document);
-                runtime.clear();
-            }
             @Override public void after(@NotNull List<? extends VFileEvent> events) {
-                boolean changed = false;
-                if (store.isShared() && events.stream().anyMatch(DoReviewService::historyEvent)) {
-                    store.reloadShared(project); changed = true;
-                }
-                for (var event : events) {
-                    if (event instanceof VFileMoveEvent move) {
-                        movePath(move.getOldPath(), move.getNewPath());
-                        invalidatePath(move.getNewPath(), false);
-                        changed = true;
-                    } else if (event instanceof VFilePropertyChangeEvent property && property.isRename()) {
-                        movePath(property.getOldPath(), property.getNewPath());
-                        invalidatePath(property.getNewPath(), false);
-                        changed = true;
-                    } else if (event instanceof VFileDeleteEvent deletion && keyForPath(deletion.getPath()) != null) {
-                        invalidatePath(deletion.getPath(), true);
-                        changed = true;
-                    } else if (event instanceof VFileCreateEvent creation && keyForPath(creation.getPath()) != null) {
-                        changed = true;
-                    } else if (event instanceof VFileContentChangeEvent content && !content.isFromSave()
-                            && keyForPath(content.getPath()) != null) {
-                        // The document listener handles its eventual reload. Unrelated VFS events
-                        // must not discard known row identities in other open documents.
-                        changed = true;
-                    }
-                }
-                // Source edits retain evidence; shared metadata is scoped to the current checkout.
-                if (changed) refreshAll();
+                afterVfsChanges(events);
             }
         });
-        refreshAll();
+    }
+
+    private void afterVfsChanges(List<? extends VFileEvent> events) {
+        boolean changed = false;
+        if (store.isShared() && events.stream().anyMatch(DoReviewService::historyEvent)) {
+            // Filesystem hints are not proof that review facts changed. Storage reconciles
+            // the artifacts before its notification invalidates any affected document.
+            store.reconcileShared(project);
+        }
+        refreshGitConfiguration(events);
+        for (var event : events) {
+            if (event instanceof VFileMoveEvent move) {
+                movePath(move.getOldPath(), move.getNewPath());
+                invalidatePath(move.getNewPath(), false);
+                changed = true;
+            } else if (event instanceof VFilePropertyChangeEvent property && property.isRename()) {
+                movePath(property.getOldPath(), property.getNewPath());
+                invalidatePath(property.getNewPath(), false);
+                changed = true;
+            } else if (event instanceof VFileDeleteEvent deletion && keyForPath(deletion.getPath()) != null) {
+                invalidatePath(deletion.getPath(), true);
+                changed = true;
+            } else if (event instanceof VFileCreateEvent creation && keyForPath(creation.getPath()) != null) {
+                changed = true;
+            } else if (event instanceof VFileContentChangeEvent content && !content.isFromSave()
+                    && keyForPath(content.getPath()) != null) {
+                // The document listener handles its eventual reload. Unrelated VFS events
+                // must not discard known row identities in other open documents.
+                changed = true;
+            }
+        }
+        // Source edits retain evidence; shared metadata is scoped to the current checkout.
+        if (changed) refreshAll();
+    }
+
+    private void refreshGitConfiguration(List<? extends VFileEvent> events) {
+        var candidates = events.stream().flatMap(event -> {
+                    if (event instanceof VFileMoveEvent move) return java.util.stream.Stream.of(move.getOldPath(), move.getNewPath());
+                    if (event instanceof VFilePropertyChangeEvent property && property.isRename())
+                        return java.util.stream.Stream.of(property.getOldPath(), property.getNewPath());
+                    return java.util.stream.Stream.of(event.getPath());
+                })
+                .filter(path -> path.endsWith("/config") || path.endsWith("/config.worktree")).toList();
+        if (candidates.isEmpty() || project.getBasePath() == null) return;
+        for (var document : List.copyOf(runtime.keySet())) {
+            if (!isGitDocument(document)) continue;
+            var file = FileDocumentManager.getInstance().getFile(document);
+            Path root = ReviewRepositoryPaths.rootFor(file.toNioPath(), Path.of(project.getBasePath()));
+            if (candidates.stream().noneMatch(path -> ReviewGitConfiguration.affects(root, Path.of(path)))) continue;
+            var state = runtime.get(document);
+            scheduler.cancel(document);
+            state.retainPresentation = state.stablePresentation && state.presentationStamp == document.getModificationStamp()
+                    && state.text.equals(document.getText());
+            state.stamp = -1;
+            state.ready = false;
+            refreshDocument(document);
+        }
     }
     public boolean supports(Document document) { return keyFor(document) != null; }
     private static boolean historyEvent(VFileEvent event) {
@@ -233,21 +352,45 @@ public final class DoReviewService implements Disposable {
     }
     public FileProjection projection(Document document) {
         ApplicationManager.getApplication().assertIsDispatchThread();
-        var history = history(document);
         var state = runtime.get(document);
+        String key = keyFor(document);
+        if (store.isShared() && key != null && !store.isLoaded(project, key) && state != null
+                && state.projection != null && (state.stamp == document.getModificationStamp()
+                || state.stablePresentation && state.presentationStamp == document.getModificationStamp())
+                && store.diagnostics(project).isEmpty()) return state.projection;
+        var history = history(document);
         if (state == null) {
             state = new RuntimeProjection();
             state.hints = savedHints(document);
             runtime.put(document, state);
+        } else if (store.isShared() && state.history != history) {
+            // The worker installs immutable models before posting its EDT notification.
+            // Observe a replacement here as well, so an earlier UI callback cannot use it
+            // with a coincidentally equal numeric revision from a different event set.
+            refreshSharedHistory(document);
         }
         if (state.projection != null && state.stamp == document.getModificationStamp() && state.revision == history.revision()) return state.projection;
         String text = document.getText();
+        boolean retain = state.retainPresentation && state.projection != null && state.text.equals(text)
+                && state.contextGeneration == contextGeneration(document);
+        state.retainPresentation = false;
         state.text = text;
         state.stamp = document.getModificationStamp();
         state.revision = history.revision();
+        state.history = history;
+        state.persistedHints = savedHints(document);
+        state.checkout = key == null ? null : store.checkoutToken(project, key);
+        state.contextGeneration = contextGeneration(document);
         state.ready = history.evidence().isEmpty();
-        // Until PSI finishes, show exact facts as pending, never as unconfirmed green.
-        state.projection = exactProjection(history, text, false);
+        // Stable facts stay visible during background refresh. A real text edit took the
+        // synchronous clear path; syntax-dependent exact facts remain pending until PSI.
+        if (!retain) {
+            boolean git = isGitDocument(document);
+            state.projection = exactProjection(history, text, git);
+            state.stablePresentation = git;
+            state.presentationHistory = history;
+            state.presentationStamp = state.stamp;
+        }
         if (!state.ready) schedule(document, state, history, text);
         return state.projection;
     }
@@ -261,7 +404,7 @@ public final class DoReviewService implements Disposable {
     private static FileProjection exactProjection(ReviewHistory history, String text, boolean contextConfirmed) {
         var exact = exactHistory(history, text);
         var snapshot = FileSnapshot.create(text);
-        var context = contextConfirmed ? ContextMap.fallback(text)
+        var context = contextConfirmed ? ReviewProjectionComputer.gitContext(text)
                 : new ContextMap("pending-context", Collections.nCopies(1 + (int) text.chars().filter(c -> c == '\n').count(), null));
         return ReviewHistoryEngine.project(exact, text, Map.of(snapshot.id(), context), context, ProjectionHints.empty());
     }
@@ -269,44 +412,77 @@ public final class DoReviewService implements Disposable {
         var file = FileDocumentManager.getInstance().getFile(document);
         long stamp = target.stamp, generation = ++target.generation;
         long epoch = storeEpoch.get();
-        long contextGeneration = project.getService(ContextAnalysisManager.class).generation();
+        long contextGeneration = contextGeneration(document);
         var hints = target.hints;
+        var request = new ProjectionRequest(document, target, history, stamp, generation, epoch, contextGeneration,
+                target.checkout);
         scheduler.schedule(document, () -> computer.capture(history, file, text),
                 contexts -> {
                     var result = computer.computeResult(history, text, hints, contexts);
-                    return new PreparedProjection(result, store.prepareCheckpoint(history, text, result.checkpoint()));
-                }, prepared -> {
-            if (disposed || storeEpoch.get() != epoch || runtime.get(document) != target || target.generation != generation
-                    || document.getModificationStamp() != stamp || history(document).revision() != history.revision()
-                    || project.getService(ContextAnalysisManager.class).generation() != contextGeneration) return;
-            String key = keyFor(document);
-            if (key == null || !store.commitCheckpoint(project, key, prepared.checkpoint())) {
-                target.stamp = -1;
-                refreshDocument(document);
-                return;
-            }
-            var result = prepared.result();
-            target.projection = result.projection();
-            target.ready = true;
-            target.hints = result.hints();
-            refreshDocument(document);
-        }, failure -> {
-            if (disposed || runtime.get(document) != target || target.generation != generation || storeEpoch.get() != epoch) return;
-            LOG.warn("Review projection failed; keeping only unconfirmed exact facts", failure);
-            // A terminal worker failure has not resolved historical row identities. Keep the
-            // edit guard and clear expansion active; the cached stamp prevents an automatic retry loop.
-            target.ready = false;
-            notifyInfo("Review state could not be confirmed. Edit or reopen the file to retry; saved history is preserved.");
-            refreshDocument(document);
-        });
+                    return new PreparedProjection(result, contexts.gitBased() ? null
+                            : store.prepareCheckpoint(history, text, result.checkpoint()));
+                }, prepared -> deliverProjection(request, prepared), failure -> projectionFailed(request, failure));
+    }
+
+    private void deliverProjection(ProjectionRequest request, PreparedProjection prepared) {
+        if (!isCurrentProjection(request)) return;
+        String key = keyFor(request.document);
+        if (key == null || prepared.checkpoint() != null && !store.commitCheckpoint(project, key, prepared.checkpoint())) {
+            request.target.stamp = -1;
+            refreshDocument(request.document);
+            return;
+        }
+        var result = prepared.result();
+        request.target.projection = result.projection();
+        request.target.ready = true;
+        request.target.stablePresentation = true;
+        request.target.presentationHistory = request.history;
+        request.target.presentationStamp = request.stamp;
+        request.target.hints = result.hints();
+        request.target.persistedHints = savedHints(request.document);
+        refreshDocument(request.document);
+    }
+
+    private boolean isCurrentProjection(ProjectionRequest request) {
+        return !disposed && storeEpoch.get() == request.epoch && runtime.get(request.document) == request.target
+                && request.target.generation == request.generation
+                && request.document.getModificationStamp() == request.stamp
+                && matchesCurrentHistory(request)
+                && contextGeneration(request.document) == request.contextGeneration
+                && Objects.equals(request.checkout, store.checkoutToken(project, keyFor(request.document)));
+    }
+
+    private boolean matchesCurrentHistory(ProjectionRequest request) {
+        var current = history(request.document);
+        return current.revision() == request.history.revision() && sameHistoryFacts(request.history, current);
+    }
+
+    private void projectionFailed(ProjectionRequest request, Throwable failure) {
+        if (disposed || runtime.get(request.document) != request.target || request.target.generation != request.generation
+                || storeEpoch.get() != request.epoch) return;
+        LOG.warn("Review projection failed; keeping only unconfirmed exact facts", failure);
+        // A terminal worker failure has not resolved historical row identities. Keep the
+        // edit guard and clear expansion active; the cached stamp prevents an automatic retry loop.
+        request.target.ready = false;
+        notifyInfo("Review state could not be confirmed. Edit or reopen the file to retry; saved history is preserved.");
+        refreshDocument(request.document);
     }
     private ProjectionHints savedHints(Document document) {
+        if (isGitDocument(document)) return ProjectionHints.empty();
         String key = keyFor(document);
         return key == null ? ProjectionHints.empty() : store.checkpoint(project, key, document.getText());
     }
     private void savePendingHints(Document document, ProjectionHints hints) {
+        if (isGitDocument(document)) return;
         String key = keyFor(document);
         if (key != null) store.checkpointPending(project, key, document.getText(), hints);
+    }
+
+    private boolean isGitDocument(Document document) {
+        return computer.isGitFile(FileDocumentManager.getInstance().getFile(document));
+    }
+    private long contextGeneration(Document document) {
+        return isGitDocument(document) ? -1 : project.getService(ContextAnalysisManager.class).generation();
     }
     public boolean isProjectionReady(Document document) {
         projection(document);
@@ -358,42 +534,56 @@ public final class DoReviewService implements Disposable {
         // A rapid second Ctrl+M may precede the full historical projection. Finish revoking
         // older variants from the captured version, without touching subsequently created proofs.
         if (!state.ready) {
-            long epoch = storeEpoch.get();
-            boolean sharedCommand = store.isShared();
-            String checkout = store.checkoutToken(project, key);
-            var file = FileDocumentManager.getInstance().getFile(document);
-            pendingRevocations++;
-            scheduler.submit(() -> computer.capture(before, file, text),
-                    contexts -> computer.project(before, text, hints, contexts), resolved -> {
-                        var related = resolved.rows().stream().filter(row -> row.start() < end && row.end() > start)
-                                .flatMap(row -> row.revocableRefs().stream()).distinct().toList();
-                        Runnable finish = () -> {
-                            try {
-                            if (disposed || sharedCommand != store.isShared()) return;
-                            if (sharedCommand ? !java.util.Objects.equals(checkout, store.checkoutToken(project, key))
-                                    : epoch != storeEpoch.get()) return;
-                            // Proof ownership stays stable when the path changes. A branch
-                            // switch cannot route a previous checkout's command into this one.
-                            store.revokeByEvidence(project, related);
-                            invalidate(document);
-                            } finally {
-                                pendingRevocations--;
-                                refreshDocument(document);
-                            }
-                        };
-                        if (sharedCommand) store.whenLoaded(project, key, text, finish);
-                        else finish.run();
-                    }, failure -> {
-                        if (disposed) return;
-                        pendingRevocations--;
-                        if (sharedCommand || epoch == storeEpoch.get()) {
-                            LOG.warn("Could not finish revoking historical review variants", failure);
-                            notifyInfo("Could not revoke all historical versions. Use Clear All Reviews in File or retry.");
-                            refreshDocument(document);
-                        }
-                    });
+            schedulePendingRevocation(document, key, before, hints, text, start, end);
         }
         invalidate(document);
+    }
+
+    private void schedulePendingRevocation(Document document, String key, ReviewHistory before,
+                                           ProjectionHints hints, String text, int start, int end) {
+        long epoch = storeEpoch.get();
+        boolean sharedCommand = store.isShared();
+        String checkout = store.checkoutToken(project, key);
+        var file = FileDocumentManager.getInstance().getFile(document);
+        var request = new PendingRevocation(document, key, text, epoch, sharedCommand, checkout);
+        pendingRevocations++;
+        scheduler.submit(() -> computer.capture(before, file, text),
+                contexts -> computer.project(before, text, hints, contexts), resolved -> {
+                    var related = resolved.rows().stream().filter(row -> row.start() < end && row.end() > start)
+                            .flatMap(row -> row.revocableRefs().stream()).distinct().toList();
+                    completePendingRevocation(request, related);
+                }, failure -> pendingRevocationFailed(request, failure));
+    }
+
+    private void completePendingRevocation(PendingRevocation request, List<EvidenceRef> related) {
+        Runnable finish = () -> finishPendingRevocation(request, related);
+        if (request.sharedCommand) store.whenLoaded(project, request.key, request.text, finish);
+        else finish.run();
+    }
+
+    private void finishPendingRevocation(PendingRevocation request, List<EvidenceRef> related) {
+        try {
+            if (disposed || request.sharedCommand != store.isShared()) return;
+            if (request.sharedCommand ? !java.util.Objects.equals(request.checkout, store.checkoutToken(project, request.key))
+                    : request.epoch != storeEpoch.get()) return;
+            // Proof ownership stays stable when the path changes. A branch
+            // switch cannot route a previous checkout's command into this one.
+            store.revokeByEvidence(project, related);
+            invalidate(request.document);
+        } finally {
+            pendingRevocations--;
+            refreshDocument(request.document);
+        }
+    }
+
+    private void pendingRevocationFailed(PendingRevocation request, Throwable failure) {
+        if (disposed) return;
+        pendingRevocations--;
+        if (request.sharedCommand || request.epoch == storeEpoch.get()) {
+            LOG.warn("Could not finish revoking historical review variants", failure);
+            notifyInfo("Could not revoke all historical versions. Use Clear All Reviews in File or retry.");
+            refreshDocument(request.document);
+        }
     }
     public void clearFile(Document document) {
         String key = keyFor(document);
@@ -404,7 +594,7 @@ public final class DoReviewService implements Disposable {
     }
     private void invalidate(Document document) {
         var state = runtime.get(document);
-        if (state != null) state.stamp = -1;
+        if (state != null) { state.stamp = -1; state.retainPresentation = false; state.stablePresentation = false; }
         refreshDocument(document);
     }
     private boolean deferUntilLoaded(Document document, Runnable command) {
@@ -418,7 +608,7 @@ public final class DoReviewService implements Disposable {
         });
         return true;
     }
-    String authorsFor(Document document, List<dev.doreview.core.EvidenceRef> refs) {
+    String authorsFor(Document document, List<EvidenceRef> refs) {
         String key = keyFor(document);
         return key == null ? "" : store.authors(project, key, refs);
     }
@@ -427,9 +617,12 @@ public final class DoReviewService implements Disposable {
             ApplicationManager.getApplication().invokeLater(this::historyReloaded, project.getDisposed());
             return;
         }
-        if (store.isShared()) scheduler.cancelProjections();
-        else { scheduler.cancelAll(); pendingRevocations = 0; }
-        runtime.clear();
+        if (store.isShared()) {
+            for (var document : List.copyOf(runtime.keySet())) refreshSharedHistory(document);
+        } else {
+            scheduler.cancelAll(); pendingRevocations = 0;
+            runtime.clear();
+        }
         reportStorageWarnings();
         refreshAll();
     }
@@ -438,8 +631,11 @@ public final class DoReviewService implements Disposable {
     }
     private void contextChanged() {
         for (var document : List.copyOf(runtime.keySet())) {
+            if (isGitDocument(document)) continue;
             scheduler.cancel(document);
             runtime.get(document).stamp = -1;
+            runtime.get(document).retainPresentation = false;
+            runtime.get(document).stablePresentation = false;
             presentation.clearConfirmed(document);
         }
         refreshAll();
@@ -552,13 +748,23 @@ public final class DoReviewService implements Disposable {
     }
     private static final class RuntimeProjection {
         String text = "";
-        long stamp = -1, revision = -1, generation;
-        boolean ready;
+        long stamp = -1, revision = -1, generation, contextGeneration, presentationStamp = -1;
+        boolean ready, retainPresentation, stablePresentation;
         int lastMarkedStart = -1, lastMarkedEnd;
         String lastMarkedText;
         ProjectionHints hints = ProjectionHints.empty();
+        ProjectionHints persistedHints = ProjectionHints.empty();
+        ReviewHistory history;
+        ReviewHistory presentationHistory;
+        String checkout;
         FileProjection projection;
     }
+    /** Frozen delivery coordinates; mutable projection state remains owned by the EDT service. */
+    private record ProjectionRequest(Document document, RuntimeProjection target, ReviewHistory history,
+                                     long stamp, long generation, long epoch, long contextGeneration, String checkout) { }
+    /** Completion coordinates for an independent command over already captured evidence. */
+    private record PendingRevocation(Document document, String key, String text,
+                                     long epoch, boolean sharedCommand, String checkout) { }
     private record PreparedProjection(ReviewProjectionComputer.Result result,
                                       ReviewHistoryStore.PreparedCheckpoint checkpoint) { }
 }

@@ -2,11 +2,7 @@ package dev.doreview.ide;
 
 import com.intellij.openapi.application.ApplicationManager;
 import com.intellij.openapi.application.PathManager;
-import com.intellij.openapi.components.PersistentStateComponentWithModificationTracker;
 import com.intellij.openapi.components.PathMacroManager;
-import com.intellij.openapi.components.RoamingType;
-import com.intellij.openapi.components.Service;
-import com.intellij.openapi.components.State;
 import com.intellij.openapi.components.StateStorageChooserEx;
 import com.intellij.openapi.components.StateStorageOperation;
 import com.intellij.openapi.components.Storage;
@@ -73,7 +69,7 @@ class LegacyReviewHistoryModel implements StateStorageChooserEx {
         synchronized (lock) {
             if (unsupportedSchema) return ReviewHistory.empty();
             ProjectState entry = state.projects.get(projectKey(project));
-            FileState file = entry == null ? null : findFile(project, entry, relativePath);
+            FileState file = entry == null ? null : Aliases.findFile(project, entry, relativePath);
             ReviewHistory history = file == null ? null : safeRead(entry, file);
             return history == null ? ReviewHistory.empty() : history;
         }
@@ -84,45 +80,10 @@ class LegacyReviewHistoryModel implements StateStorageChooserEx {
         synchronized (lock) {
             if (unsupportedSchema) return ProjectionHints.empty();
             ProjectState entry = state.projects.get(projectKey(project));
-            FileState file = entry == null ? null : findFile(project, entry, relativePath);
+            FileState file = entry == null ? null : Aliases.findFile(project, entry, relativePath);
             ReviewHistory history = file == null ? null : safeRead(entry, file);
             if (history == null) return ProjectionHints.empty();
-            try {
-                if (file.checkpoints == null) throw new IllegalArgumentException("Missing checkpoint collection");
-                if (file.runtimePending != null && file.runtimePending.text().equals(text)) return file.runtimePending.hints();
-                String hash = FileSnapshot.create(text).id();
-                RuntimeCheckpoint settled = file.runtimeCheckpoints.get(hash);
-                if (settled != null) return settled.hints();
-                if (file.pendingCheckpoint != null && (file.pendingCheckpoint.payload == null
-                        || hash.equals(file.pendingCheckpoint.payload.textHash)) && file.runtimePending == null) {
-                    return validated(file, file.pendingCheckpoint).forText(text, hash);
-                }
-                if (file.checkpoints.containsKey(hash)) return validated(file, file.checkpoints.get(hash)).forText(text, hash);
-                // A changed live original without an existing exact-text copy may rematch.
-                // Keep real lost origins and locators that distinguish known duplicate copies.
-                var authority = new HashSet<EvidenceRef>();
-                for (var checkpoint : file.checkpoints.entrySet()) {
-                    if (file.runtimeCheckpoints.containsKey(checkpoint.getKey())) continue;
-                    var value = validated(file, checkpoint.getValue());
-                    if (!value.textHash().equals(checkpoint.getKey())) throw new IllegalArgumentException("Checkpoint key mismatch");
-                    authority.addAll(value.restrictions());
-                }
-                file.runtimeCheckpoints.values().forEach(value -> addRestrictions(authority, value));
-                if (file.runtimePending != null) addRestrictions(authority, file.runtimePending);
-                else if (file.pendingCheckpoint != null) authority.addAll(validated(file, file.pendingCheckpoint).restrictions());
-                return new ProjectionHints(Map.of(), authority);
-            } catch (RuntimeException invalid) {
-                readWarning(entry, "Ignored damaged review provenance checkpoint for " + file.path + ": " + invalid.getMessage());
-                return ProjectionCheckpointCodec.failClosed(evidenceIndex(file));
-            }
-        }
-    }
-
-    private static void addRestrictions(Set<EvidenceRef> authority, RuntimeCheckpoint checkpoint) {
-        var hints = checkpoint.hints();
-        var rematchable = ProjectionCheckpointCodec.rematchable(hints, checkpoint.text());
-        for (var ref : hints.authoritativeRefs()) {
-            if (!rematchable.contains(ref)) authority.add(ref);
+            return Checkpoints.hints(entry, file, text);
         }
     }
 
@@ -133,14 +94,14 @@ class LegacyReviewHistoryModel implements StateStorageChooserEx {
         synchronized (lock) {
             if (unsupportedSchema) return;
             ProjectState entry = state.projects.get(projectKey(project));
-            FileState file = entry == null ? null : findFile(project, entry, relativePath);
+            FileState file = entry == null ? null : Aliases.findFile(project, entry, relativePath);
             ReviewHistory history = file == null ? null : safeRead(entry, file);
             if (history == null) return;
             file.runtimeCheckpoints.put(hash, new RuntimeCheckpoint(text, compact));
             modificationCount++;
             if (file.runtimePending != null && file.runtimePending.text().equals(text)) file.runtimePending = null;
             if (file.pendingCheckpoint != null && file.pendingCheckpoint.payload != null
-                    && hash.equals(file.pendingCheckpoint.payload.textHash)) clearPending(file);
+                    && hash.equals(file.pendingCheckpoint.payload.textHash)) Checkpoints.clearPending(file);
         }
     }
 
@@ -157,18 +118,18 @@ class LegacyReviewHistoryModel implements StateStorageChooserEx {
         synchronized (lock) {
             if (unsupportedSchema) return false;
             ProjectState entry = state.projects.get(projectKey(project));
-            FileState file = entry == null ? null : findFile(project, entry, relativePath);
+            FileState file = entry == null ? null : Aliases.findFile(project, entry, relativePath);
             if (file == null || file.cachedHistory != prepared.expectedHistory) return false;
             String hash = prepared.encoded.payload.textHash;
             if (file.checkpoints == null) file.checkpoints = new TreeMap<>();
-            replaceCheckpoint(file, hash, prepared.encoded);
+            Checkpoints.replaceCheckpoint(file, hash, prepared.encoded);
             modificationCount++;
             file.runtimeCheckpoints.remove(hash);
             file.validatedCheckpoints.put(prepared.encoded,
                     ProjectionCheckpointCodec.cached(prepared.encoded, prepared.hints));
             if (file.runtimePending != null && file.runtimePending.text().equals(prepared.text)) file.runtimePending = null;
             if (file.pendingCheckpoint != null && file.pendingCheckpoint.payload != null
-                    && hash.equals(file.pendingCheckpoint.payload.textHash)) clearPending(file);
+                    && hash.equals(file.pendingCheckpoint.payload.textHash)) Checkpoints.clearPending(file);
             return true;
         }
     }
@@ -178,50 +139,13 @@ class LegacyReviewHistoryModel implements StateStorageChooserEx {
         synchronized (lock) {
             if (unsupportedSchema) return;
             ProjectState entry = state.projects.get(projectKey(project));
-            FileState file = entry == null ? null : findFile(project, entry, relativePath);
+            FileState file = entry == null ? null : Aliases.findFile(project, entry, relativePath);
             ReviewHistory history = file == null ? null : safeRead(entry, file);
             if (history == null) return;
-            clearPending(file);
+            Checkpoints.clearPending(file);
             file.runtimePending = new RuntimeCheckpoint(text, hints);
             modificationCount++;
         }
-    }
-
-    private static void clearPending(FileState file) {
-        forgetValidation(file, file.pendingCheckpoint);
-        file.pendingCheckpoint = null;
-    }
-
-    private static void replaceCheckpoint(FileState file, String hash, CheckpointState checkpoint) {
-        CheckpointState previous = file.checkpoints.put(hash, checkpoint);
-        if (previous != checkpoint) forgetValidation(file, previous);
-    }
-
-    private static void forgetValidation(FileState file, CheckpointState checkpoint) {
-        if (checkpoint == null) return;
-        file.validatedCheckpoints.remove(checkpoint);
-        file.invalidCheckpoints.remove(checkpoint);
-    }
-
-    private static ProjectionCheckpointCodec.EvidenceIndex evidenceIndex(FileState file) {
-        if (file.evidenceIndex == null) file.evidenceIndex = ProjectionCheckpointCodec.index(readHistory(file));
-        return file.evidenceIndex;
-    }
-
-    private static ProjectionCheckpointCodec.ValidatedCheckpoint validated(FileState file, CheckpointState checkpoint) {
-        String invalid = file.invalidCheckpoints.get(checkpoint);
-        if (invalid != null) throw new IllegalArgumentException(invalid);
-        var cached = file.validatedCheckpoints.get(checkpoint);
-        if (cached == null) {
-            try {
-                cached = ProjectionCheckpointCodec.validate(evidenceIndex(file), checkpoint);
-                file.validatedCheckpoints.put(checkpoint, cached);
-            } catch (RuntimeException failure) {
-                file.invalidCheckpoints.put(checkpoint, failure.getMessage() == null ? "Invalid checkpoint" : failure.getMessage());
-                throw failure;
-            }
-        }
-        return cached;
     }
 
     public @Nullable ReviewEvidence mark(Project project, String relativePath, String text, int start, int end) {
@@ -236,7 +160,7 @@ class LegacyReviewHistoryModel implements StateStorageChooserEx {
             // A blank-only decision must not create a file record or switch an existing alias.
             if (normalized.substring(first, last).isBlank()) return null;
             ProjectState entry = projectState(project);
-            FileState file = writableFile(project, entry, relativePath);
+            FileState file = Aliases.writableFile(project, entry, relativePath);
             ReviewHistory before = readHistory(file);
             ReviewHistory next = ReviewHistoryEngine.review(before, text,
                     List.of(range), System.currentTimeMillis());
@@ -253,7 +177,7 @@ class LegacyReviewHistoryModel implements StateStorageChooserEx {
         synchronized (lock) {
             requireWritableSchema();
             ProjectState entry = state.projects.get(projectKey(project));
-            FileState file = entry == null ? null : findFile(project, entry, relativePath);
+            FileState file = entry == null ? null : Aliases.findFile(project, entry, relativePath);
             ReviewHistory history = file == null ? null : safeRead(entry, file);
             if (history != null) {
                 var next = ReviewHistoryEngine.revoke(history, references);
@@ -303,7 +227,7 @@ class LegacyReviewHistoryModel implements StateStorageChooserEx {
         synchronized (lock) {
             requireWritableSchema();
             ProjectState entry = state.projects.get(projectKey(project));
-            FileState file = entry == null ? null : findFile(project, entry, relativePath);
+            FileState file = entry == null ? null : Aliases.findFile(project, entry, relativePath);
             if (file == null) return;
             ReviewHistory history = safeRead(entry, file);
             if (history == null) return;
@@ -326,11 +250,11 @@ class LegacyReviewHistoryModel implements StateStorageChooserEx {
             if (entry == null) return List.of();
             TreeSet<String> result = new TreeSet<>();
             entry.files.forEach((id, file) -> {
-                if (file == null || !validPath(file.path)) {
+                if (file == null || !Aliases.validPath(file.path)) {
                     readWarning(entry, "Skipped damaged review history path for record " + id);
                     return;
                 }
-                List<String> existing = existingAliases(project, entry, id);
+                List<String> existing = Aliases.existingAliases(project, entry, id);
                 result.add(existing.contains(file.path) || existing.size() != 1 ? file.path : existing.getFirst());
             });
             return List.copyOf(result);
@@ -339,8 +263,8 @@ class LegacyReviewHistoryModel implements StateStorageChooserEx {
 
     /** Explicit/observed rename only. Old aliases remain usable after checking out an earlier branch. */
     public boolean movePath(Project project, String oldPath, String newPath) {
-        oldPath = relativePath(oldPath);
-        newPath = relativePath(newPath);
+        oldPath = Aliases.relativePath(oldPath);
+        newPath = Aliases.relativePath(newPath);
         synchronized (lock) {
             requireWritableSchema();
             ProjectState entry = state.projects.get(projectKey(project));
@@ -348,7 +272,7 @@ class LegacyReviewHistoryModel implements StateStorageChooserEx {
             Map<String, String> destinations = new LinkedHashMap<>();
             Map<String, String> primaryPaths = new LinkedHashMap<>();
             for (var alias : entry.aliases.entrySet()) {
-                if (!matches(alias.getKey(), oldPath)) continue;
+                if (!Aliases.matches(alias.getKey(), oldPath)) continue;
                 FileState source = entry.files.get(alias.getValue());
                 if (source == null || (!alias.getKey().equals(source.path)
                         && Files.isRegularFile(Path.of(project.getBasePath()).resolve(source.path)))) continue;
@@ -453,7 +377,7 @@ class LegacyReviewHistoryModel implements StateStorageChooserEx {
             List<String> warnings = new ArrayList<>();
             for (var old : new TreeMap<>(legacy).entrySet()) {
                 try {
-                    String path = relativePath(old.getKey());
+                    String path = Aliases.relativePath(old.getKey());
                     LegacyFile legacyFile = old.getValue();
                     if (legacyFile == null || legacyFile.snapshot() == null || legacyFile.ranges() == null) {
                         throw new IllegalArgumentException("missing saved snapshot or ranges");
@@ -471,7 +395,7 @@ class LegacyReviewHistoryModel implements StateStorageChooserEx {
                     }
                     if (ranges.isEmpty()) continue;
                     FileSnapshot snapshot = FileSnapshot.create(legacyFile.snapshot());
-                    FileState file = writableFile(project, entry, path);
+                    FileState file = Aliases.writableFile(project, entry, path);
                     ReviewHistory history = readHistory(file);
                     String id = "legacy-" + sha256(projectKey(project) + "\n" + path + "\n" + snapshot.id() + "\n" + ranges);
                     if (history.evidence().stream().anyMatch(record -> record.id().equals(id))) continue;
@@ -531,49 +455,6 @@ class LegacyReviewHistoryModel implements StateStorageChooserEx {
         return key;
     }
 
-    private static String relativePath(String path) {
-        if (path == null) throw new IllegalArgumentException("Missing relative file path");
-        String normalized = path.replace('\\', '/');
-        if (normalized.startsWith("/") || normalized.matches("^[A-Za-z]:.*")) {
-            throw new IllegalArgumentException("Absolute file path is not allowed");
-        }
-        for (String segment : normalized.split("/", -1)) {
-            if (segment.isEmpty() || segment.equals(".") || segment.equals("..")) {
-                throw new IllegalArgumentException("Invalid relative file path");
-            }
-        }
-        return normalized;
-    }
-
-    private static FileState findFile(Project project, ProjectState entry, String path) {
-        path = relativePath(path);
-        String id = entry.aliases.get(path);
-        FileState file = id == null ? null : entry.files.get(id);
-        if (file == null || path.equals(file.path)) return file;
-        List<String> existing = existingAliases(project, entry, id);
-        // An old alias may reappear after checkout, but a copied file must not inherit history.
-        return existing.size() == 1 && existing.contains(path) ? file : null;
-    }
-
-    private static List<String> existingAliases(Project project, ProjectState entry, String id) {
-        Path base = Path.of(project.getBasePath());
-        return entry.aliases.entrySet().stream().filter(alias -> java.util.Objects.equals(alias.getValue(), id))
-                .map(Map.Entry::getKey).filter(LegacyReviewHistoryModel::validPath)
-                .filter(path -> Files.isRegularFile(base.resolve(path))).toList();
-    }
-
-    private static FileState writableFile(Project project, ProjectState entry, String path) {
-        path = relativePath(path);
-        FileState existing = findFile(project, entry, path);
-        if (existing != null && safeRead(entry, existing) != null) return existing;
-        FileState created = new FileState();
-        created.path = path;
-        String id = UUID.randomUUID().toString();
-        entry.files.put(id, created);
-        entry.aliases.put(path, id);
-        return created;
-    }
-
     private static ReviewHistory safeRead(ProjectState entry, FileState file) {
         if (file.quarantined) return null;
         try { return readHistory(file); }
@@ -584,17 +465,8 @@ class LegacyReviewHistoryModel implements StateStorageChooserEx {
         }
     }
 
-    private static boolean validPath(String path) {
-        try { relativePath(path); return true; }
-        catch (IllegalArgumentException invalid) { return false; }
-    }
-
     private void requireWritableSchema() {
         if (unsupportedSchema) throw new IllegalStateException("Review history uses an unsupported schema; it is read-only");
-    }
-
-    private static boolean matches(String path, String prefix) {
-        return path.equals(prefix) || path.startsWith(prefix + "/");
     }
 
     private static ReviewHistory readHistory(FileState file) {
@@ -680,7 +552,7 @@ class LegacyReviewHistoryModel implements StateStorageChooserEx {
                 synchronized (lock) {
                     if (export.live().runtimeCheckpoints.get(hash) == value) {
                         if (export.live().checkpoints == null) export.live().checkpoints = new TreeMap<>();
-                        replaceCheckpoint(export.live(), hash, internal);
+                        Checkpoints.replaceCheckpoint(export.live(), hash, internal);
                         export.live().runtimeCheckpoints.remove(hash);
                         export.live().validatedCheckpoints.put(internal,
                                 ProjectionCheckpointCodec.cached(internal, value.hints()));
@@ -743,7 +615,7 @@ class LegacyReviewHistoryModel implements StateStorageChooserEx {
     CapturedFile captureFile(Project project, String path) {
         synchronized (lock) {
             var entry = state.projects.get(projectKey(project));
-            var file = entry == null ? null : findFile(project, entry, path);
+            var file = entry == null ? null : Aliases.findFile(project, entry, path);
             if (file == null) return null;
             return new CapturedFile(file.path, readHistory(file), Map.copyOf(file.checkpoints),
                     Map.copyOf(file.runtimeCheckpoints), file.runtimePending, file.pendingCheckpoint);
@@ -869,6 +741,144 @@ class LegacyReviewHistoryModel implements StateStorageChooserEx {
             expectedHistory = history; this.text = text; this.hints = hints; this.encoded = encoded;
         }
     }
+    /** Checkpoint rules run under the owning model lock and never create evidence. */
+    private static final class Checkpoints {
+        private Checkpoints() { }
+
+        private static ProjectionHints hints(ProjectState entry, FileState file, String text) {
+            try {
+                if (file.checkpoints == null) throw new IllegalArgumentException("Missing checkpoint collection");
+                if (file.runtimePending != null && file.runtimePending.text().equals(text)) return file.runtimePending.hints();
+                String hash = FileSnapshot.create(text).id();
+                RuntimeCheckpoint settled = file.runtimeCheckpoints.get(hash);
+                if (settled != null) return settled.hints();
+                if (file.pendingCheckpoint != null && (file.pendingCheckpoint.payload == null
+                        || hash.equals(file.pendingCheckpoint.payload.textHash)) && file.runtimePending == null) {
+                    return validated(file, file.pendingCheckpoint).forText(text, hash);
+                }
+                if (file.checkpoints.containsKey(hash)) return validated(file, file.checkpoints.get(hash)).forText(text, hash);
+                // A changed live original without an existing exact-text copy may rematch.
+                // Keep real lost origins and locators that distinguish known duplicate copies.
+                var authority = new HashSet<EvidenceRef>();
+                for (var checkpoint : file.checkpoints.entrySet()) {
+                    if (file.runtimeCheckpoints.containsKey(checkpoint.getKey())) continue;
+                    var value = validated(file, checkpoint.getValue());
+                    if (!value.textHash().equals(checkpoint.getKey())) throw new IllegalArgumentException("Checkpoint key mismatch");
+                    authority.addAll(value.restrictions());
+                }
+                file.runtimeCheckpoints.values().forEach(value -> addRestrictions(authority, value));
+                if (file.runtimePending != null) addRestrictions(authority, file.runtimePending);
+                else if (file.pendingCheckpoint != null) authority.addAll(validated(file, file.pendingCheckpoint).restrictions());
+                return new ProjectionHints(Map.of(), authority);
+            } catch (RuntimeException invalid) {
+                readWarning(entry, "Ignored damaged review provenance checkpoint for " + file.path + ": " + invalid.getMessage());
+                return ProjectionCheckpointCodec.failClosed(evidenceIndex(file));
+            }
+        }
+
+        private static void addRestrictions(Set<EvidenceRef> authority, RuntimeCheckpoint checkpoint) {
+            var hints = checkpoint.hints();
+            var rematchable = ProjectionCheckpointCodec.rematchable(hints, checkpoint.text());
+            for (var ref : hints.authoritativeRefs()) {
+                if (!rematchable.contains(ref)) authority.add(ref);
+            }
+        }
+
+        private static void clearPending(FileState file) {
+            forgetValidation(file, file.pendingCheckpoint);
+            file.pendingCheckpoint = null;
+        }
+
+        private static void replaceCheckpoint(FileState file, String hash, CheckpointState checkpoint) {
+            CheckpointState previous = file.checkpoints.put(hash, checkpoint);
+            if (previous != checkpoint) forgetValidation(file, previous);
+        }
+
+        private static void forgetValidation(FileState file, CheckpointState checkpoint) {
+            if (checkpoint == null) return;
+            file.validatedCheckpoints.remove(checkpoint);
+            file.invalidCheckpoints.remove(checkpoint);
+        }
+
+        private static ProjectionCheckpointCodec.EvidenceIndex evidenceIndex(FileState file) {
+            if (file.evidenceIndex == null) file.evidenceIndex = ProjectionCheckpointCodec.index(readHistory(file));
+            return file.evidenceIndex;
+        }
+
+        private static ProjectionCheckpointCodec.ValidatedCheckpoint validated(FileState file, CheckpointState checkpoint) {
+            String invalid = file.invalidCheckpoints.get(checkpoint);
+            if (invalid != null) throw new IllegalArgumentException(invalid);
+            var cached = file.validatedCheckpoints.get(checkpoint);
+            if (cached == null) {
+                try {
+                    cached = ProjectionCheckpointCodec.validate(evidenceIndex(file), checkpoint);
+                    file.validatedCheckpoints.put(checkpoint, cached);
+                } catch (RuntimeException failure) {
+                    file.invalidCheckpoints.put(checkpoint, failure.getMessage() == null ? "Invalid checkpoint" : failure.getMessage());
+                    throw failure;
+                }
+            }
+            return cached;
+        }
+    }
+
+    /** Legacy alias identity, including branch resurrection and copied-file exclusion. */
+    private static final class Aliases {
+        private Aliases() { }
+
+        private static String relativePath(String path) {
+            if (path == null) throw new IllegalArgumentException("Missing relative file path");
+            String normalized = path.replace('\\', '/');
+            if (normalized.startsWith("/") || normalized.matches("^[A-Za-z]:.*")) {
+                throw new IllegalArgumentException("Absolute file path is not allowed");
+            }
+            for (String segment : normalized.split("/", -1)) {
+                if (segment.isEmpty() || segment.equals(".") || segment.equals("..")) {
+                    throw new IllegalArgumentException("Invalid relative file path");
+                }
+            }
+            return normalized;
+        }
+
+        private static FileState findFile(Project project, ProjectState entry, String path) {
+            path = relativePath(path);
+            String id = entry.aliases.get(path);
+            FileState file = id == null ? null : entry.files.get(id);
+            if (file == null || path.equals(file.path)) return file;
+            List<String> existing = existingAliases(project, entry, id);
+            // An old alias may reappear after checkout, but a copied file must not inherit history.
+            return existing.size() == 1 && existing.contains(path) ? file : null;
+        }
+
+        private static List<String> existingAliases(Project project, ProjectState entry, String id) {
+            Path base = Path.of(project.getBasePath());
+            return entry.aliases.entrySet().stream().filter(alias -> java.util.Objects.equals(alias.getValue(), id))
+                    .map(Map.Entry::getKey).filter(Aliases::validPath)
+                    .filter(path -> Files.isRegularFile(base.resolve(path))).toList();
+        }
+
+        private static FileState writableFile(Project project, ProjectState entry, String path) {
+            path = relativePath(path);
+            FileState existing = findFile(project, entry, path);
+            if (existing != null && safeRead(entry, existing) != null) return existing;
+            FileState created = new FileState();
+            created.path = path;
+            String id = UUID.randomUUID().toString();
+            entry.files.put(id, created);
+            entry.aliases.put(path, id);
+            return created;
+        }
+
+        private static boolean validPath(String path) {
+            try { relativePath(path); return true; }
+            catch (IllegalArgumentException invalid) { return false; }
+        }
+
+        private static boolean matches(String path, String prefix) {
+            return path.equals(prefix) || path.startsWith(prefix + "/");
+        }
+    }
+
     private record RuntimeCheckpoint(String text, ProjectionHints hints) { }
     private record CheckpointExport(FileState live, FileState target, Map<String, RuntimeCheckpoint> settled,
                                     RuntimeCheckpoint pending, ReviewHistory history) { }

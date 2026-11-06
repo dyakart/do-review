@@ -254,8 +254,9 @@ public final class SharedReviewHistoryStoreTest extends BasePlatformTestCase {
         assertNull(new ReviewFileAccess(getProject()).relativePath(metadata.getPath()));
     }
 
-    public void testLegacyPositiveLocatorAndAliasCannotSupersedeExistingSharedOriginDenial() throws Exception {
-        initGit(base(), AUTHOR, EMAIL);
+    public void testNonGitLegacyPositiveLocatorAndAliasCannotSupersedeExistingSharedOriginDenial() throws Exception {
+        // Context-origin denials still govern non-Git files. Git repositories now derive
+        // unchanged lines from Git and intentionally ignore these legacy heuristic locators.
         String current = SOURCE + "suffix = 4\n";
         var file = myFixture.addFileToProject("renamed.py", current).getVirtualFile();
         String path = relative(file.getPath());
@@ -361,6 +362,73 @@ public final class SharedReviewHistoryStoreTest extends BasePlatformTestCase {
         assertEquals(mainProof.id(), store.history(getProject(), mainPath).evidence().getFirst().id());
         assertEquals("Ordinary Git merge must combine immutable operations from the same reviewer",
                 3, events(base()).size());
+    }
+
+    public void testGitBranchInheritsUnchangedLinesAndRestoresEachBranchesExplicitRevocations() throws Exception {
+        initGit(base(), AUTHOR, EMAIL);
+        git(base(), "branch", "-m", "source");
+        var file = myFixture.addFileToProject("branch.py", SOURCE).getVirtualFile();
+        String path = relative(file.getPath());
+        FileDocumentManager.getInstance().saveAllDocuments();
+        git(base(), "add", path); git(base(), "commit", "-qm", "Initial source");
+        git(base(), "branch", "feature"); // This older branch has no portable review files.
+        myFixture.configureFromExistingVirtualFile(file);
+        Document document = myFixture.getEditor().getDocument();
+        service.initialize(); fresh(document);
+        service.mark(document, 0, document.getTextLength()); fresh(document); drain(store); fresh(document);
+        String proof = service.history(document).evidence().getFirst().id();
+        assertEquals(4, service.coverage(document).reviewed());
+        git(base(), "add", ".doreview"); git(base(), "commit", "-qm", "Source review");
+
+        String featureText = SOURCE.replace("def compute(value):", "def renamed(value):");
+        String sourceToken = store.checkoutToken(getProject(), path);
+        git(base(), "checkout", "-q", "feature");
+        Files.writeString(Path.of(file.getPath()), featureText, StandardCharsets.UTF_8);
+        git(base(), "add", path); git(base(), "commit", "-qm", "Feature function header");
+        refreshCheckout(file, document, path, sourceToken, featureText);
+        assertEquals(proof, service.history(document).evidence().getFirst().id());
+        assertFalse("The changed header must require review", green(document, 0));
+        assertTrue("An unchanged body must inherit the source review", green(document, 1));
+        assertTrue(green(document, 2)); assertTrue(green(document, 3));
+        assertTrue("A checkout and projection must not publish borrowed review files", events(base()).isEmpty());
+        service.clear(document, document.getLineStartOffset(1), document.getLineStartOffset(2));
+        fresh(document); drain(store); fresh(document);
+        assertFalse("The explicit feature revocation must take effect", green(document, 1));
+        assertTrue(green(document, 2));
+        assertEquals(2, events(base()).size()); // Original causal evidence plus one explicit revocation.
+        git(base(), "add", ".doreview"); git(base(), "commit", "-qm", "Feature review revocation");
+
+        String featureToken = store.checkoutToken(getProject(), path);
+        git(base(), "checkout", "-q", "source");
+        refreshCheckout(file, document, path, featureToken, SOURCE);
+        assertEquals(proof, service.history(document).evidence().getFirst().id());
+        assertTrue("Returning to source restores its original header review", green(document, 0));
+        assertTrue("Feature revocations must not pollute source", green(document, 1));
+        assertTrue(service.history(document).revocations().isEmpty());
+
+        restartFacade(); service.initialize(); fresh(document);
+        assertTrue("Source marks must survive a fresh production coordinator", green(document, 1));
+        sourceToken = store.checkoutToken(getProject(), path);
+        git(base(), "checkout", "-q", "feature");
+        refreshCheckout(file, document, path, sourceToken, featureText);
+        assertFalse(green(document, 0)); assertFalse(green(document, 1)); assertTrue(green(document, 2));
+        restartFacade(); service.initialize(); fresh(document);
+        assertFalse("Feature revocations must survive a fresh production coordinator", green(document, 1));
+        assertTrue(green(document, 2));
+        assertTrue(store.diagnostics(getProject()).toString(), store.diagnostics(getProject()).isEmpty());
+    }
+
+    private void refreshCheckout(com.intellij.openapi.vfs.VirtualFile file, Document document, String path,
+                                 String previousToken, String expectedText) {
+        file.refresh(false, false);
+        FileDocumentManager.getInstance().reloadFromDisk(document);
+        store.reconcileShared(getProject());
+        PlatformTestUtil.waitWithEventsDispatching("The production checkout and document did not converge", () -> {
+            String token = store.checkoutToken(getProject(), path);
+            return token != null && !token.equals(previousToken) && document.getText().equals(expectedText)
+                    && service.isProjectionReady(document);
+        }, 20);
+        fresh(document);
     }
 
     public void testRapidRenameThenSaveKeepsFileIdentityAndModifiedRowUnreviewed() throws Exception {

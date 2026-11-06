@@ -1,10 +1,8 @@
 package dev.doreview.core;
 
 import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -87,12 +85,9 @@ public final class ReviewHistoryEngine {
         var currentLines = workspace.currentIndex().lines();
         var context = currentContext == null ? ContextMap.fallback(snapshot.text()) : currentContext;
         var live = hints == null ? ProjectionHints.empty() : hints;
-        var rowBuilders = new ArrayList<RowBuilder>();
-        for (int i = 0; i < currentLines.text().size(); i++) rowBuilders.add(new RowBuilder());
+        var result = new ProjectionAccumulator(currentLines);
         var fallbackContexts = new HashMap<String, ContextMap>();
         var unresolvedTexts = new HashMap<ReviewedRange, Set<String>>();
-        var deletions = new LinkedHashMap<DeletionKey, LinkedHashSet<EvidenceRef>>();
-        var changeGroups = new LinkedHashMap<Object, ChangeGroup>();
         for (var proofRow : proofRows(history, cancellationCheck)) {
             cancellationCheck.run();
             var baseline = history.snapshots().get(proofRow.proof().snapshotId());
@@ -103,7 +98,7 @@ public final class ReviewHistoryEngine {
             }
             boolean exactSnapshot = baseline.id().equals(snapshot.id());
             if (exactSnapshot) {
-                contribute(rowBuilders, currentLines, proofRow, proofRow.line(), baselineContext, context);
+                result.contribute(proofRow, proofRow.line(), baselineContext, context);
                 continue;
             }
             boolean authoritative = live.authoritativeRefs().contains(proofRow.ref());
@@ -113,14 +108,14 @@ public final class ReviewHistoryEngine {
                     int line = currentLines.lineAt(position.start());
                     if (line >= 0 && position.start() == currentLines.starts()[line]
                             && position.end() == currentLines.end(line)) {
-                        contribute(rowBuilders, currentLines, proofRow, line, baselineContext, context);
+                        result.contribute(proofRow, line, baselineContext, context);
                     }
                 }
                 continue;
             }
             if (authoritative && live.deletedRefs().contains(proofRow.ref())) {
                 var anchor = live.deletedAnchors().get(proofRow.ref());
-                addDeletion(deletions, anchor == null ? Math.min(proofRow.ref().baselineStart(), snapshot.text().length())
+                result.addDeletion(anchor == null ? Math.min(proofRow.ref().baselineStart(), snapshot.text().length())
                                 : anchor.offset(),
                         anchor == null ? proofRow.line() : anchor.ordinal(), proofRow.ref());
                 continue;
@@ -143,24 +138,22 @@ public final class ReviewHistoryEngine {
                             ? FileProjection.Status.CHANGED : FileProjection.Status.NEEDS_REVIEW;
                     var localChange = new SnapshotReconciler.Change(0, 0, first, last + 1,
                             SnapshotReconciler.ChangeReason.TEXT_CHANGED);
-                    var key = new LocalChangeKey(unresolved.range(), reason, unresolved.excludedRows());
-                    var diagnosticReason = reason;
-                    changeGroups.computeIfAbsent(key, ignored -> new ChangeGroup(localChange, status,
-                            diagnosticReason, unresolved.excludedRows())).add(proofRow);
+                    result.addLocalChange(unresolved.range(), reason, unresolved.excludedRows(),
+                            localChange, status, proofRow);
                 } else if (unresolved == null && !live.baselineTexts().containsKey(proofRow.ref())) {
                     // A cold checkpoint can retain a denial without retaining any coordinates.
                     // Text matching may locate a diagnostic, never recover that denied identity.
                     var mapping = workspace.mapping(baseline);
                     int mapped = mapping.currentLine(proofRow.line());
                     if (mapped >= 0) {
-                        addPossibleDiagnostic(rowBuilders, mapped, FileProjection.Status.NEEDS_REVIEW,
+                        result.addPossibleDiagnostic(mapped, FileProjection.Status.NEEDS_REVIEW,
                                 FileProjection.Reason.AMBIGUOUS, proofRow);
                     } else {
                         var change = mapping.changeForOldLine(proofRow.line());
                         if (change != null && change.reason() == SnapshotReconciler.ChangeReason.TEXT_CHANGED
                                 && change.oldEndLine() - change.oldStartLine() == 1
                                 && change.currentEndLine() - change.currentStartLine() == 1) {
-                            addPossibleDiagnostic(rowBuilders, change.currentStartLine(), FileProjection.Status.CHANGED,
+                            result.addPossibleDiagnostic(change.currentStartLine(), FileProjection.Status.CHANGED,
                                     FileProjection.Reason.TEXT_CHANGED, proofRow);
                         }
                     }
@@ -171,7 +164,7 @@ public final class ReviewHistoryEngine {
             int mapped = mapping.currentLine(proofRow.line());
             if (mapped >= 0) {
                 if (!authoritative) {
-                    contribute(rowBuilders, currentLines, proofRow, mapped, baselineContext, context);
+                    result.contribute(proofRow, mapped, baselineContext, context);
                 }
                 // An authoritative missing identity may not reappear on an identical copy.
                 continue;
@@ -181,7 +174,7 @@ public final class ReviewHistoryEngine {
             if (change.reason() == SnapshotReconciler.ChangeReason.DELETED) {
                 int anchor = change.currentStartLine() < currentLines.text().size()
                         ? currentLines.starts()[change.currentStartLine()] : snapshot.text().length();
-                addDeletion(deletions, anchor, proofRow.line() - change.oldStartLine(), proofRow.ref());
+                result.addDeletion(anchor, proofRow.line() - change.oldStartLine(), proofRow.ref());
             } else {
                 var reason = switch (change.reason()) {
                     case AMBIGUOUS -> FileProjection.Reason.AMBIGUOUS;
@@ -194,80 +187,13 @@ public final class ReviewHistoryEngine {
                         && change.oldEndLine() - change.oldStartLine() == change.currentEndLine() - change.currentStartLine()) {
                     // A changed row locator is diagnostic, never proof of unchanged content.
                     int line = change.currentStartLine() + proofRow.line() - change.oldStartLine();
-                    rowBuilders.get(line).add(status, reason, proofRow);
+                    result.addRow(line, status, reason, proofRow);
                 } else {
-                    var key = new ChangeKey(baseline.id(), change);
-                    changeGroups.computeIfAbsent(key, ignored -> new ChangeGroup(change, status, reason)).add(proofRow);
+                    result.addChange(baseline.id(), change, status, reason, proofRow);
                 }
             }
         }
-        for (var group : changeGroups.values()) {
-            var possible = new FileProjection.PossibleEvidence(group.reason, new ArrayList<>(group.refs));
-            for (int line = group.change.currentStartLine(); line < group.change.currentEndLine(); line++) {
-                if ((line & 255) == 0) cancellationCheck.run();
-                if (!covered(group.excludedRows, currentLines.starts()[line], currentLines.end(line))) {
-                    rowBuilders.get(line).addGroup(group.status, group.reason, group.sequence, possible);
-                }
-            }
-        }
-        var rows = new ArrayList<FileProjection.Row>();
-        var reviewed = new ArrayList<ReviewedRange>();
-        var yellow = new ArrayList<ReviewedRange>();
-        var changed = new ArrayList<ReviewedRange>();
-        for (int i = 0; i < rowBuilders.size(); i++) {
-            if ((i & 255) == 0) cancellationCheck.run();
-            var builder = rowBuilders.get(i);
-            var range = currentLines.range(i);
-            if (currentLines.text().get(i).isBlank()) {
-                rows.add(new FileProjection.Row(i, range.start(), range.end(), FileProjection.Status.UNREVIEWED,
-                        FileProjection.Reason.UNREVIEWED, List.of()));
-                continue;
-            }
-            rows.add(new FileProjection.Row(i, range.start(), range.end(), builder.status,
-                    builder.reason, builder.evidence()));
-            switch (builder.status) {
-                case REVIEWED -> reviewed.add(range);
-                case NEEDS_REVIEW -> yellow.add(range);
-                case CHANGED -> changed.add(range);
-                default -> { }
-            }
-        }
-        var deleted = deletions.entrySet().stream()
-                .sorted(Comparator.comparingInt((Map.Entry<DeletionKey, LinkedHashSet<EvidenceRef>> entry) -> entry.getKey().offset())
-                        .thenComparingInt(entry -> entry.getKey().ordinal()))
-                .map(entry -> new FileProjection.DeletedRow(entry.getKey().offset(), entry.getKey().ordinal(),
-                        new ArrayList<>(entry.getValue()))).toList();
-        return new FileProjection(snapshot.id(), history.revision(), rows, ReviewRanges.normalized(reviewed),
-                ReviewRanges.normalized(yellow), ReviewRanges.normalized(changed), deleted);
-    }
-
-    private static void addPossibleDiagnostic(List<RowBuilder> rows, int line, FileProjection.Status status,
-            FileProjection.Reason reason, ProofRow proof) {
-        rows.get(line).addGroup(status, reason, proof.proof().sequence(),
-                new FileProjection.PossibleEvidence(reason, List.of(proof.ref())));
-    }
-
-    private static void contribute(List<RowBuilder> rows, LineTable currentLines, ProofRow proof,
-            int currentLine, ContextMap baselineContext, ContextMap currentContext) {
-        if (!proof.lines().text().get(proof.line()).equals(currentLines.text().get(currentLine))) {
-            rows.get(currentLine).add(FileProjection.Status.CHANGED, FileProjection.Reason.TEXT_CHANGED, proof);
-            return;
-        }
-        String oldFingerprint = baselineContext.fingerprint(proof.line());
-        String newFingerprint = currentContext.fingerprint(currentLine);
-        if (!baselineContext.provider().equals(currentContext.provider())
-                || oldFingerprint == null || newFingerprint == null || !proof.complete()) {
-            rows.get(currentLine).add(FileProjection.Status.NEEDS_REVIEW, FileProjection.Reason.UNKNOWN_CONTEXT, proof);
-        } else if (!oldFingerprint.equals(newFingerprint)) {
-            rows.get(currentLine).add(FileProjection.Status.NEEDS_REVIEW, FileProjection.Reason.CONTEXT_CHANGED, proof);
-        } else {
-            rows.get(currentLine).add(FileProjection.Status.REVIEWED, FileProjection.Reason.EXACT, proof);
-        }
-    }
-
-    private static void addDeletion(Map<DeletionKey, LinkedHashSet<EvidenceRef>> deletions,
-            int anchor, int ordinal, EvidenceRef ref) {
-        deletions.computeIfAbsent(new DeletionKey(anchor, ordinal), ignored -> new LinkedHashSet<>()).add(ref);
+        return result.finish(snapshot.id(), history.revision(), cancellationCheck);
     }
 
     /** Active baseline row references, shared with local provenance helpers. */
@@ -284,86 +210,5 @@ public final class ReviewHistoryEngine {
         return ReviewHistoryIndex.of(history, cancellationCheck).snapshotsByRecency();
     }
 
-    private static boolean covered(List<ReviewedRange> ranges, int start, int end) {
-        int low = 0;
-        int high = ranges.size();
-        while (low < high) {
-            int middle = (low + high) >>> 1;
-            if (ranges.get(middle).end() <= start) low = middle + 1;
-            else high = middle;
-        }
-        return low < ranges.size() && ranges.get(low).start() <= start && ranges.get(low).end() >= end;
-    }
-
     record ProofRow(ReviewEvidence proof, EvidenceRef ref, int line, LineTable lines, boolean complete) { }
-
-    private record DeletionKey(int offset, int ordinal) { }
-    private record ChangeKey(String snapshotId, SnapshotReconciler.Change change) { }
-    private record LocalChangeKey(ReviewedRange range, FileProjection.Reason reason, List<ReviewedRange> excludedRows) { }
-
-    private static final class ChangeGroup {
-        private final SnapshotReconciler.Change change;
-        private final FileProjection.Status status;
-        private final FileProjection.Reason reason;
-        private final LinkedHashSet<EvidenceRef> refs = new LinkedHashSet<>();
-        private final List<ReviewedRange> excludedRows;
-        private long sequence;
-
-        private ChangeGroup(SnapshotReconciler.Change change, FileProjection.Status status, FileProjection.Reason reason) {
-            this(change, status, reason, List.of());
-        }
-
-        private ChangeGroup(SnapshotReconciler.Change change, FileProjection.Status status,
-                FileProjection.Reason reason, List<ReviewedRange> excludedRows) {
-            this.change = change;
-            this.status = status;
-            this.reason = reason;
-            this.excludedRows = excludedRows;
-        }
-
-        private void add(ProofRow proof) {
-            refs.add(proof.ref());
-            sequence = Math.max(sequence, proof.proof().sequence());
-        }
-    }
-
-    private static final class RowBuilder {
-        private FileProjection.Status status = FileProjection.Status.UNREVIEWED;
-        private FileProjection.Reason reason = FileProjection.Reason.UNREVIEWED;
-        private long sequence = -1;
-        private final LinkedHashSet<EvidenceRef> refs = new LinkedHashSet<>();
-        private final List<FileProjection.PossibleEvidence> groups = new ArrayList<>();
-
-        private void add(FileProjection.Status candidate, FileProjection.Reason why, ProofRow proof) {
-            refs.add(proof.ref());
-            select(candidate, why, proof.proof().sequence());
-        }
-
-        private void addGroup(FileProjection.Status candidate, FileProjection.Reason why, long sequence,
-                FileProjection.PossibleEvidence possible) {
-            groups.add(possible);
-            select(candidate, why, sequence);
-        }
-
-        private FileProjection.RowEvidence evidence() {
-            return new FileProjection.RowEvidence(new ArrayList<>(refs), groups);
-        }
-
-        private void select(FileProjection.Status candidate, FileProjection.Reason why, long candidateSequence) {
-            if (rank(candidate) > rank(status) || rank(candidate) == rank(status) && candidateSequence >= sequence) {
-                status = candidate;
-                reason = why;
-                sequence = candidateSequence;
-            }
-        }
-
-        private static int rank(FileProjection.Status status) {
-            return switch (status) {
-                case REVIEWED -> 3;
-                case NEEDS_REVIEW -> 2;
-                case CHANGED -> 1;
-                case UNREVIEWED -> 0;
-            };
-        }
-    }
 }

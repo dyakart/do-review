@@ -75,14 +75,22 @@ intellijPlatform {
     }
 }
 
-tasks.register('rangeEngineTest', JavaExec) {
-    dependsOn testClasses
-    classpath = sourceSets.test.runtimeClasspath
-    mainClass = 'dev.doreview.core.RangeEngineTest'
-    enableAssertions = true
+// These executable tests use assertions rather than the IDE's JUnit runner.
+def standaloneCoreTests = [
+        rangeEngineTest: 'RangeEngineTest',
+        snapshotReconcilerTest: 'SnapshotReconcilerTest',
+        lineReviewTrackerTest: 'LineReviewTrackerTest',
+        reviewHistoryEngineTest: 'ReviewHistoryEngineTest'
+]
+standaloneCoreTests.each { taskName, className ->
+    def coreTest = tasks.register(taskName, JavaExec) {
+        dependsOn testClasses
+        classpath = sourceSets.test.runtimeClasspath
+        mainClass = "dev.doreview.core.${className}"
+        enableAssertions = true
+    }
+    tasks.named('check') { dependsOn coreTest }
 }
-
-check.dependsOn rangeEngineTest
 
 test {
     systemProperty 'doreview.data.path', layout.buildDirectory.dir('test-data/review-history').get().asFile.absolutePath
@@ -96,38 +104,8 @@ test {
     // Tests use a flat classpath: use the platform's Kotlin runtime instead.
     classpath = classpath.filter { !it.name.startsWith('kotlin-stdlib-')
             && !it.name.startsWith('kotlinx-serialization-') }
-    exclude '**/core/RangeEngineTest.class'
-    exclude '**/core/SnapshotReconcilerTest.class'
-    exclude '**/core/LineReviewTrackerTest.class'
-    exclude '**/core/ReviewHistoryEngineTest.class'
+    standaloneCoreTests.values().each { className -> exclude "**/core/${className}.class" }
 }
-
-tasks.register('snapshotReconcilerTest', JavaExec) {
-    dependsOn testClasses
-    classpath = sourceSets.test.runtimeClasspath
-    mainClass = 'dev.doreview.core.SnapshotReconcilerTest'
-    enableAssertions = true
-}
-
-check.dependsOn snapshotReconcilerTest
-
-tasks.register('lineReviewTrackerTest', JavaExec) {
-    dependsOn testClasses
-    classpath = sourceSets.test.runtimeClasspath
-    mainClass = 'dev.doreview.core.LineReviewTrackerTest'
-    enableAssertions = true
-}
-
-check.dependsOn lineReviewTrackerTest
-
-tasks.register('reviewHistoryEngineTest', JavaExec) {
-    dependsOn testClasses
-    classpath = sourceSets.test.runtimeClasspath
-    mainClass = 'dev.doreview.core.ReviewHistoryEngineTest'
-    enableAssertions = true
-}
-
-check.dependsOn reviewHistoryEngineTest
 
 // A real compilation boundary: domain code may depend only on the JDK base module.
 tasks.register('compileCoreIsolation', JavaCompile) {

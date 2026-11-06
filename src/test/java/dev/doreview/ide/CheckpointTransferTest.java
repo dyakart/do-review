@@ -1,10 +1,14 @@
 package dev.doreview.ide;
 
+import com.google.gson.Gson;
+import com.google.gson.JsonParser;
 import com.intellij.openapi.util.JDOMUtil;
 import com.intellij.testFramework.fixtures.BasePlatformTestCase;
 import com.intellij.util.xmlb.XmlSerializer;
 import dev.doreview.core.EvidenceRef;
+import dev.doreview.core.FileSnapshot;
 import dev.doreview.core.ProjectionHints;
+import dev.doreview.core.ReviewEvidence;
 import dev.doreview.core.ReviewHistory;
 import dev.doreview.core.ReviewedRange;
 
@@ -26,6 +30,44 @@ public final class CheckpointTransferTest extends BasePlatformTestCase {
     @Override protected void setUp() throws Exception {
         super.setUp();
         store = new ReviewHistoryStore(Path.of(getProject().getBasePath(), "checkpoint-backups"));
+    }
+
+    public void testFixedPreRefactorCheckpointsKeepChecksumsAndCanonicalOutput() {
+        // Captured with the pre-refactor encoder and platform serializer at 7188ef6.
+        String v1 = """
+                {"checksum":"f99d9be779890e5e46efbccf2175fdcca3fa3818191f5a4cca2ac28c3981b128",
+                 "payload":{"version":1,
+                 "textHash":"2c8b08da5ce60398e1f19af0e5dccc744df274b826abe585eaba68c525434806",
+                 "textLength":4,"refs":[{"evidenceId":"fixture-proof","start":0,"end":4,
+                 "authoritative":true,"deleted":false,"allowRematch":false,
+                 "live":{"start":0,"end":4},"baselineText":"one\\n"}]}}
+                """;
+        String v2 = """
+                {"checksum":"287b0d31a26ab0f09e90df919da7fa56d16293dce909ec04debd464b556af2e2",
+                 "payload":{"version":2,
+                 "textHash":"2c8b08da5ce60398e1f19af0e5dccc744df274b826abe585eaba68c525434806",
+                 "textLength":4,"refs":[{"evidenceId":"fixture-proof","start":0,"end":4,
+                 "authoritative":true,"deleted":false,"allowRematch":false,
+                 "live":{"start":0,"end":4},"baselineText":"one\\n"}]}}
+                """;
+        String text = "one\n";
+        var snapshot = new FileSnapshot("2c8b08da5ce60398e1f19af0e5dccc744df274b826abe585eaba68c525434806", text);
+        var ref = new EvidenceRef("fixture-proof", 0, 4);
+        var history = new ReviewHistory(Map.of(snapshot.id(), snapshot),
+                List.of(new ReviewEvidence(ref.evidenceId(), snapshot.id(), List.of(ref.range()), 1, 1)), List.of(), 1);
+        var expectedHints = new ProjectionHints(Map.of(ref, new ReviewedRange(0, 4)), Set.of(ref), Set.of(),
+                Map.of(), Map.of(ref, text), Map.of());
+        var gson = new Gson();
+        for (String fixture : List.of(v1, v2)) {
+            var checkpoint = gson.fromJson(fixture, ReviewHistoryStore.CheckpointState.class);
+            assertEquals(checkpoint.checksum, ProjectionCheckpointCodec.checksum(checkpoint.payload));
+            var decoded = ProjectionCheckpointCodec.decode(history, text, checkpoint);
+            assertEquals(expectedHints, decoded);
+            assertEquals(JsonParser.parseString(fixture), JsonParser.parseString(gson.toJson(checkpoint)));
+            // Both readable versions emit the same current v2 form, including its historical checksum.
+            var encoded = ProjectionCheckpointCodec.encode(history, text, decoded);
+            assertEquals(JsonParser.parseString(v2), JsonParser.parseString(gson.toJson(encoded)));
+        }
     }
 
     public void testV1NoVersion() {

@@ -33,6 +33,30 @@ public final class ReviewHistoryStore extends LegacyReviewHistoryModel implement
         if (shared == null) { if (callback != null) callback.run(); } else shared.whenLoaded(project, path, text, callback);
     }
     void reloadShared(Project project) { if (shared != null) shared.reload(project); }
+    void reconcileShared(Project project) { if (shared != null) shared.reconcile(project); }
+    ReviewCoverageHistory coverageHistory(Project project) {
+        if (shared != null) return shared.coverageHistory(project);
+        long revision = getStateModificationCount();
+        return new ReviewCoverageHistory() {
+            @Override public java.util.concurrent.CompletableFuture<Input> read(String path, String text, boolean git) {
+                try {
+                    ReviewRepositoryPaths.validateRelativePath(path);
+                    if (project.isDisposed()) throw new java.util.concurrent.CancellationException("Project closed");
+                    var history = ReviewHistoryStore.this.history(project, path);
+                    var hints = git ? ProjectionHints.empty() : ReviewHistoryStore.this.checkpoint(project, path, text);
+                    if (getStateModificationCount() != revision)
+                        throw new java.util.ConcurrentModificationException("Review history changed during coverage calculation");
+                    return java.util.concurrent.CompletableFuture.completedFuture(new Input(history, hints));
+                } catch (Throwable failure) {
+                    return java.util.concurrent.CompletableFuture.failedFuture(failure);
+                }
+            }
+            @Override public java.util.concurrent.CompletableFuture<Boolean> isCurrent() {
+                return java.util.concurrent.CompletableFuture.completedFuture(!project.isDisposed()
+                        && getStateModificationCount() == revision);
+            }
+        };
+    }
     void flushShared(Project project) { if (shared != null) shared.flush(project); }
     void flushShared(Project project, String path) { if (shared != null) shared.flush(project, path); }
     void release(Project project, String path) { if (shared != null) shared.release(project, path); }

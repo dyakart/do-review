@@ -47,12 +47,19 @@ abstract class StructuredPsiContextProvider implements ContextProvider {
     public final ContextMap analyze(PsiFile file, String text) {
         String providerId = id();
         PreparedPsi prepared = prepare(file, text);
-        PsiFile parsed = prepared.file;
+        ParsedContext parsed = collectSyntax(prepared);
+        int[] starts = ContextAnalysisManager.lineStarts(text);
+        var islands = recoveryIslands(parsed.boundaries, parsed.errors, starts, text);
+        var errorRegions = expandErrors(prepared.file, parsed.scopes, parsed.errors);
+        return fingerprintRows(providerId, text, starts, parsed.scopes, errorRegions, islands);
+    }
+
+    private ParsedContext collectSyntax(PreparedPsi prepared) {
         var scopes = new ArrayList<Scope>();
         for (TextRange range : prepared.unknown) scopes.add(new Scope(range, null));
         var errors = new ArrayList<TextRange>();
         var boundaries = new ArrayList<TextRange>();
-        parsed.accept(new PsiRecursiveElementWalkingVisitor() {
+        prepared.file.accept(new PsiRecursiveElementWalkingVisitor() {
             @Override public void visitElement(PsiElement element) {
                 ProgressManager.checkCanceled();
                 collect(element, scopes);
@@ -62,7 +69,11 @@ abstract class StructuredPsiContextProvider implements ContextProvider {
                 super.visitElement(element);
             }
         });
-        int[] starts = ContextAnalysisManager.lineStarts(text);
+        return new ParsedContext(scopes, errors, boundaries);
+    }
+
+    private static List<RecoveryIsland> recoveryIslands(List<TextRange> boundaries, List<TextRange> errors,
+                                                       int[] starts, String text) {
         var islands = new ArrayList<RecoveryIsland>();
         for (TextRange boundary : boundaries) {
             ProgressManager.checkCanceled();
@@ -76,6 +87,10 @@ abstract class StructuredPsiContextProvider implements ContextProvider {
             if (first <= last) islands.add(new RecoveryIsland(boundary, first, last));
         }
         islands.sort(Comparator.comparingInt(RecoveryIsland::first));
+        return islands;
+    }
+
+    private static List<ErrorRegion> expandErrors(PsiFile parsed, List<Scope> scopes, List<TextRange> errors) {
         // Keep parser-error expansion separate: it must never clear an adapter's unknown scope
         // or a dependency on a malformed header. Only proven preceding declarations are spared.
         List<Scope> parsedScopes = List.copyOf(scopes);
@@ -94,11 +109,29 @@ abstract class StructuredPsiContextProvider implements ContextProvider {
                 }
             }
         }
+        return errorRegions;
+    }
+
+    private static ContextMap fingerprintRows(String providerId, String text, int[] starts, List<Scope> scopes,
+                                              List<ErrorRegion> errorRegions, List<RecoveryIsland> islands) {
         scopes.sort(Comparator.comparingInt((Scope scope) -> scope.range.getStartOffset())
                 .thenComparing(Comparator.comparingInt((Scope scope) -> scope.range.getEndOffset()).reversed()));
         var values = new ArrayList<StringBuilder>(starts.length);
         boolean[] unknown = new boolean[starts.length];
         for (int ignored : starts) values.add(new StringBuilder(providerId));
+        appendScopes(scopes, text, starts, values, unknown);
+        applyErrorRegions(errorRegions, islands, starts, unknown);
+        var result = new ArrayList<String>(starts.length);
+        var fingerprints = new HashMap<String, String>();
+        for (int row = 0; row < starts.length; row++) {
+            result.add(unknown[row] ? null : fingerprints.computeIfAbsent(values.get(row).toString(),
+                    ContextAnalysisManager::digest));
+        }
+        return new ContextMap(providerId, result);
+    }
+
+    private static void appendScopes(List<Scope> scopes, String text, int[] starts,
+                                     List<StringBuilder> values, boolean[] unknown) {
         for (Scope scope : scopes) {
             ProgressManager.checkCanceled();
             int first = lineAt(starts, Math.min(scope.range.getStartOffset(), text.length()));
@@ -109,6 +142,10 @@ abstract class StructuredPsiContextProvider implements ContextProvider {
                 else values.get(row).append('|').append(scope.fingerprint);
             }
         }
+    }
+
+    private static void applyErrorRegions(List<ErrorRegion> errorRegions, List<RecoveryIsland> islands,
+                                          int[] starts, boolean[] unknown) {
         for (ErrorRegion error : errorRegions) {
             int first = lineAt(starts, error.range.getStartOffset());
             int last = lineAt(starts, Math.max(error.range.getStartOffset(), error.range.getEndOffset() - 1));
@@ -124,15 +161,10 @@ abstract class StructuredPsiContextProvider implements ContextProvider {
                 if (islandAt == islands.size() || row < islands.get(islandAt).first) unknown[row] = true;
             }
         }
-        var result = new ArrayList<String>(starts.length);
-        var fingerprints = new HashMap<String, String>();
-        for (int row = 0; row < starts.length; row++) {
-            result.add(unknown[row] ? null : fingerprints.computeIfAbsent(values.get(row).toString(),
-                    ContextAnalysisManager::digest));
-        }
-        return new ContextMap(providerId, result);
     }
 
+    /** Mutable collections belong to one analysis call and never escape as cached state. */
+    private record ParsedContext(List<Scope> scopes, List<TextRange> errors, List<TextRange> boundaries) { }
     private record RecoveryIsland(TextRange range, int first, int last) { }
     private record ErrorRegion(TextRange range, int errorStart) { }
 
@@ -168,6 +200,21 @@ abstract class StructuredPsiContextProvider implements ContextProvider {
     protected static void add(List<Scope> scopes, PsiElement owner, String kind, TextRange... headers) {
         if (owner == null) return;
         addRange(scopes, owner.getContainingFile(), owner.getTextRange(), kind, headers);
+    }
+
+    /** Adapters retain language-specific gate and literal rules; statement traversal is shared. */
+    protected static void followingGuards(List<Scope> scopes, PsiElement block,
+                                          List<? extends PsiElement> statements, Predicate<PsiElement> gate,
+                                          Predicate<PsiElement> declaration,
+                                          Function<PsiElement, List<TextRange>> payloads) {
+        int end = statements.isEmpty() ? 0 : statements.getLast().getTextRange().getEndOffset();
+        for (int index = 0; index + 1 < statements.size(); index++) {
+            PsiElement statement = statements.get(index);
+            if (containsGate(statement, gate, declaration)) {
+                followingGuard(scopes, block, statement, statements.get(index + 1), end,
+                        literalPayloads(statement, payloads, declaration));
+            }
+        }
     }
 
     /** Explicit syntactic gates affect following rows, never preceding rows or other blocks. */

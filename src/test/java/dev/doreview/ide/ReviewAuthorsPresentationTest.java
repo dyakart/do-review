@@ -78,8 +78,8 @@ public final class ReviewAuthorsPresentationTest extends BasePlatformTestCase {
         var presentation = new ReviewEditorPresentation(getProject(), parent, ignored -> { });
         try {
             presentation.render(myFixture.getEditor(), ReviewHistoryEngine.project(history, "first\n", null, null, null));
-            assertEquals("Reviewed — exact text and context confirmed", marks().getFirst().getErrorStripeTooltip());
-            assertEquals("Reviewed — exact text and context confirmed — click to compare",
+            assertEquals("Reviewed — saved review confirmed", marks().getFirst().getErrorStripeTooltip());
+            assertEquals("Reviewed — saved review confirmed — click to compare",
                     marks().getFirst().getGutterIconRenderer().getTooltipText());
         } finally { Disposer.dispose(parent); }
     }

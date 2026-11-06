@@ -59,15 +59,8 @@ public final class TolkContextProvider extends StructuredPsiContextProvider {
             add(scopes, node.getThenBranch(), "ternary:then", range(node.getCondition()));
             add(scopes, node.getElseBranch(), "ternary:else", range(node.getCondition()));
         } else if (element instanceof TolkBlockStatement node) {
-            List<TolkStatement> statements = node.getStatementList();
-            int end = statements.isEmpty() ? 0 : statements.getLast().getTextRange().getEndOffset();
-            for (int index = 0; index + 1 < statements.size(); index++) {
-                TolkStatement statement = statements.get(index);
-                if (containsGate(statement, TolkContextProvider::isGate, TolkContextProvider::isDeclaration)) {
-                    followingGuard(scopes, node, statement, statements.get(index + 1), end,
-                            literalPayloads(statement, TolkContextProvider::gatePayloads, TolkContextProvider::isDeclaration));
-                }
-            }
+            followingGuards(scopes, node, node.getStatementList(), TolkContextProvider::isGate,
+                    TolkContextProvider::isDeclaration, TolkContextProvider::gatePayloads);
             PsiElement owner = node.getParent();
             if (!(owner instanceof TolkFunctionBody || owner instanceof TolkIfStatement
                     || owner instanceof TolkElseBranch || owner instanceof TolkWhileStatement

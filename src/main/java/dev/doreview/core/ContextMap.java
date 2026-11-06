@@ -7,6 +7,7 @@ import java.util.Objects;
 
 /** Parser/version and enclosing structural-chain fingerprint per logical row. */
 public record ContextMap(String provider, List<String> fingerprints) {
+    private static final ContextMap TEXT_ONLY = new ContextMap("text-only:v1", List.of());
     public ContextMap {
         Objects.requireNonNull(provider, "provider");
         fingerprints = Collections.unmodifiableList(new ArrayList<>(fingerprints));
@@ -14,8 +15,12 @@ public record ContextMap(String provider, List<String> fingerprints) {
     }
 
     public String fingerprint(int line) {
+        if (provider.equals(TEXT_ONLY.provider) && line >= 0) return "exact-text";
         return line >= 0 && line < fingerprints.size() ? fingerprints.get(line) : null;
     }
+
+    /** Line correspondence alone establishes context; row bounds belong to the mapping. */
+    public static ContextMap textOnly() { return TEXT_ONLY; }
 
     /** Unsupported/broken parser: any file change changes the enclosing context. */
     public static ContextMap fallback(String text) {
