@@ -30,7 +30,12 @@ public final class SharedHistoryCheckoutTest extends TestCase {
 
     @Override protected void tearDown() throws Exception {
         try (var paths = Files.walk(temporary)) {
-            for (Path path : paths.sorted(Comparator.reverseOrder()).toList()) Files.deleteIfExists(path);
+            for (Path path : paths.sorted(Comparator.reverseOrder()).toList()) {
+                var dos = Files.getFileAttributeView(path, java.nio.file.attribute.DosFileAttributeView.class,
+                        java.nio.file.LinkOption.NOFOLLOW_LINKS);
+                if (dos != null) dos.setReadOnly(false);
+                Files.deleteIfExists(path);
+            }
         }
     }
 

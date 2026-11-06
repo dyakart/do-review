@@ -180,7 +180,7 @@ public final class ReviewGitProjectionTest extends BasePlatformTestCase {
     }
 
     private void initGit() throws Exception {
-        var process = new ProcessBuilder("git", "-c", "core.hooksPath=", "-C", getProject().getBasePath(),
+        var process = new ProcessBuilder("git", "-c", "core.hooksPath=", "-c", "core.longpaths=true", "-C", getProject().getBasePath(),
                 "init", "--initial-branch=main").redirectErrorStream(true).start();
         String output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
         if (!process.waitFor(10, TimeUnit.SECONDS)) {

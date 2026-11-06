@@ -358,7 +358,8 @@ public final class ReviewBackgroundRefreshTest extends BasePlatformTestCase {
 
     private void git(String... arguments) throws Exception {
         var command = new ArrayList<>(List.of("git", "-c", "user.name=Refresh Test", "-c", "user.email=refresh@example.invalid",
-                "-c", "commit.gpgsign=false", "-c", "core.hooksPath=" + base().resolve("no-test-hooks")));
+                "-c", "commit.gpgsign=false", "-c", "core.longpaths=true",
+                "-c", "core.hooksPath=" + base().resolve("no-test-hooks")));
         command.addAll(List.of(arguments));
         var process = new ProcessBuilder(command).directory(base().toFile()).redirectErrorStream(true).start();
         String output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);

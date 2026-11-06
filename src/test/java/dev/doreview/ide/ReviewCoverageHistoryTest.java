@@ -57,6 +57,16 @@ public final class ReviewCoverageHistoryTest extends BasePlatformTestCase {
                 owned.dispose();
                 await(owned.storageClosed());
             }
+            if (myFixture != null) {
+                Path git = Path.of(getProject().getBasePath(), ".git");
+                if (Files.isDirectory(git)) try (var paths = Files.walk(git)) {
+                    for (Path path : paths.toList()) {
+                        var dos = Files.getFileAttributeView(path, java.nio.file.attribute.DosFileAttributeView.class,
+                                java.nio.file.LinkOption.NOFOLLOW_LINKS);
+                        if (dos != null) dos.setReadOnly(false);
+                    }
+                }
+            }
             super.tearDown();
         } finally {
             restore("doreview.data.path", restoreData); restore("doreview.legacy.xml.path", restoreLegacy);
@@ -212,7 +222,7 @@ public final class ReviewCoverageHistoryTest extends BasePlatformTestCase {
     private static void git(Path root, String... arguments) {
         try {
             var command = new ArrayList<>(List.of("git", "-C", root.toString(), "-c", "user.name=Coverage reviewer",
-                    "-c", "user.email=coverage@example.test", "-c", "commit.gpgsign=false",
+                    "-c", "user.email=coverage@example.test", "-c", "commit.gpgsign=false", "-c", "core.longpaths=true",
                     "-c", "core.hooksPath=" + root.resolve("disabled-hooks")));
             command.addAll(List.of(arguments));
             var builder = new ProcessBuilder(command).redirectErrorStream(true);
