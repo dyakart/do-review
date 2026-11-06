@@ -132,6 +132,14 @@ These bounds cover different operations. The diff allowance does not bound all h
 
 ## Editor lifecycle and stripe
 
+### Selection coverage
+
+`ShowSelectionCoverageAction` is available in the Project view for selected files and directories, independently of an active editor. `ReviewSelectionCoverage` traverses supported text files recursively, deduplicates overlapping selections and sums reviewed/nonblank row counts before calculating the percentage. Binary files, symlinks, IDE-excluded paths and metadata trees are omitted; files over 8 MiB on disk or as normalized UTF-8 document text are skipped explicitly.
+
+The cancellable background task captures unsaved document text and contexts through short non-blocking read actions and calls `ReviewProjectionComputer.project` outside the read lock. Unmarked files contribute their nonblank lines without syntax analysis. `ReviewCoverageHistory` reads immutable inputs on the existing storage worker, including current warm models or cold pending state, without creating editor views, recovering/publishing pending work or committing checkpoints. Sessions opened only for coverage also skip pending publication during storage disposal; normal editor use promotes them to live sessions. A rescan that discovers external events reconciles existing editor views and rejects stale warm inputs. Repository observations and warm-model generations guard against changing history. Final weak document references, VFS stamps and selected-directory membership validate inputs without retaining every saved document buffer for the entire traversal. A changed input aborts the report instead of presenting partial counts as complete.
+
+### Editor resources
+
 Presentation owns highlighters, shortcuts, listeners and panels through `Disposable`. Logical stripe snapshots are prepared asynchronously from immutable document text and shared per document and modification stamp; geometry belongs to each editor, including splits. Delivery checks the active task and document stamp. Replaced work, document edits, stripe disablement and disposal cancel pending tasks. Painting reads cached snapshots without rescanning document text, history or PSI.
 
 The stripe is 14 logical pixels wide. Blank and whitespace-only rows use the reviewed green color with a separate `DoReview — blank line, no review required` tooltip. This display-only fill creates no review evidence and does not change editor highlighting, coverage or navigation. Raster priority is deletion, change, recheck, reviewed, unreviewed code, blank. Unreviewed code masks blank fill when rows share a pixel. `ReviewStripeHost` isolates SDK-specific attachment through `TextEditorComponent.__add`, skips unsupported hosts and handles delayed attachment.

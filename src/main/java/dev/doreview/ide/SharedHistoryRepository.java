@@ -384,6 +384,14 @@ public final class SharedHistoryRepository implements AutoCloseable {
 
     public synchronized String checkoutToken() { requireOpen(); return checkoutToken; }
 
+    /** A coverage reader validates these identities without installing or publishing a file view. */
+    record CoverageObservation(String checkout, String git, String events, long databaseVersion) { }
+    synchronized CoverageObservation coverageObservation() {
+        requireOpen();
+        try { return new CoverageObservation(checkoutToken, gitFingerprint, eventToken, dataVersion()); }
+        catch (SQLException failure) { throw problem("Cannot inspect review history version", failure); }
+    }
+
     public synchronized LoadedFile load(String relativePath) {
         requireOpen();
         String path = ReviewRepositoryPaths.validateRelativePath(relativePath);

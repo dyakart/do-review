@@ -24,6 +24,9 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.function.Consumer;
+import java.util.function.Supplier;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CancellationException;
 
 /** Background persistence and bounded, prevalidated per-file editor working sets. */
 final class SharedReviewHistoryStore implements Disposable {
@@ -46,6 +49,7 @@ final class SharedReviewHistoryStore implements Disposable {
     private final SharedHistoryLegacyImporter legacyImporter = new SharedHistoryLegacyImporter(
             (project, root) -> session(root, project).repository, this::warn);
     private volatile boolean disposed;
+    private final Set<CompletableFuture<?>> coverageQueries = ConcurrentHashMap.newKeySet();
     private final java.util.concurrent.CompletableFuture<Void> closed = new java.util.concurrent.CompletableFuture<>();
     java.util.concurrent.CompletableFuture<Void> closed() { return closed; }
     java.util.concurrent.CompletableFuture<Void> idle() {
@@ -58,12 +62,147 @@ final class SharedReviewHistoryStore implements Disposable {
         watcher.scheduleWithFixedDelay(this::poll, 2, 2, TimeUnit.SECONDS);
     }
 
+    ReviewCoverageHistory coverageHistory(Project project) { return new CoverageReader(project); }
+
+    /** Uses the existing storage worker without creating, releasing or flushing editor views. */
+    private final class CoverageReader implements ReviewCoverageHistory {
+        private final Project project;
+        private final Map<Path, CoverageRoot> roots = new HashMap<>(); // worker confined
+        private final Map<Key, CoverageView> observedViews = new HashMap<>();
+
+        CoverageReader(Project project) { this.project = project; }
+
+        @Override public CompletableFuture<Input> read(String path, String text, boolean git) {
+            return coverageQuery(project, () -> {
+                ReviewRepositoryPaths.validateRelativePath(path);
+                Path base = Path.of(project.getBasePath());
+                Path source = base.resolve(path);
+                Path root = ReviewRepositoryPaths.rootFor(source, base);
+                CoverageRoot observed = roots.get(root);
+                if (observed == null) {
+                    var session = session(root, project, false);
+                    rescanCoverage(session);
+                    observed = new CoverageRoot(session, session.repository.coverageObservation());
+                    roots.put(root, observed);
+                }
+                requireCurrent(observed);
+                var key = new Key(project, path);
+                var view = views.get(key);
+                var current = view == null ? null : observed.session.repository.load(ReviewRepositoryPaths.relativePath(root, source));
+                Input result = null;
+                if (view != null) {
+                    synchronized (view) {
+                        observe(key, view);
+                        if (view.model != null && !view.failed && view.session != null
+                                && view.session.repository == observed.session.repository
+                                && observed.version.checkout().equals(view.token)) {
+                            if (!sameFrontier(view.persisted, current)) throw changedCoverage();
+                            result = new Input(view.model.history(project, path),
+                                    git ? ProjectionHints.empty() : view.model.checkpoint(project, path, text));
+                        }
+                    }
+                } else {
+                    observe(key, null);
+                }
+                // Cold decoding and SQLite work must not hold a view lock that an EDT
+                // mark/clear command may need while the previous checkout remains visible.
+                if (result == null) result = readCold(observed.session.repository, root, source, path, text, git);
+                requireCurrent(observed);
+                return result;
+            });
+        }
+
+        private void observe(Key key, View view) {
+            var snapshot = view == null ? new CoverageView(null, null, 0)
+                    : new CoverageView(view, view.model, view.generation);
+            var prior = observedViews.putIfAbsent(key, snapshot);
+            if (prior != null && !prior.equals(snapshot)) throw changedCoverage();
+        }
+
+        private Input readCold(SharedHistoryRepository repository, Path root, Path source,
+                               String path, String text, boolean git) {
+            String repoPath = ReviewRepositoryPaths.relativePath(root, source);
+            var loaded = repository.load(repoPath);
+            String id = loaded == null ? repository.fileIdFor(repoPath) : loaded.fileId();
+            var pending = repository.pending(id, repository.checkoutToken());
+            var file = pending != null ? pending : loaded == null ? null : loaded.state();
+            if (file == null) return new Input(ReviewHistory.empty(), ProjectionHints.empty());
+            var history = ReviewJournalCodec.read(file);
+            if (git) return new Input(history, ProjectionHints.empty());
+            // Decode legacy constraints in a detached model, without warming the live view
+            // or publishing recoverable pending work as normal editor loading would do.
+            var state = new ReviewHistoryStore.StoreState(); state.schemaVersion = 2;
+            var entry = new ReviewHistoryStore.ProjectState(); entry.legacyImported = true;
+            var copy = ReviewHistoryStateCopies.file(file); copy.path = path;
+            entry.files.put(id, copy); entry.aliases.put(path, id);
+            state.projects.put(LegacyReviewHistoryModel.projectKey(project), entry);
+            var model = new LegacyReviewHistoryModel(ReviewHistoryStore.backupDirectory());
+            model.loadDetachedState(state);
+            return new Input(history, model.checkpoint(project, path, text));
+        }
+
+        @Override public CompletableFuture<Boolean> isCurrent() {
+            return coverageQuery(project, () -> {
+                for (var observed : roots.values()) {
+                    rescanCoverage(observed.session);
+                    if (!observed.version.equals(observed.session.repository.coverageObservation())) return false;
+                }
+                for (var entry : observedViews.entrySet()) {
+                    var view = views.get(entry.getKey());
+                    var observed = entry.getValue();
+                    if (view != observed.view) return false;
+                    if (view != null) synchronized (view) {
+                        if (view.model != observed.model || view.generation != observed.generation || view.failed) return false;
+                    }
+                }
+                return true;
+            });
+        }
+
+        private void rescanCoverage(Session session) {
+            if (session.repository.rescan() && visibleHistoryChanged(session))
+                deliver(project, () -> reload(project));
+        }
+    }
+
+    private static boolean sameFrontier(SharedHistoryRepository.LoadedFile first, SharedHistoryRepository.LoadedFile second) {
+        return first == null ? second == null : second != null
+                && first.fileId().equals(second.fileId()) && first.frontier().equals(second.frontier());
+    }
+    private record CoverageRoot(Session session, SharedHistoryRepository.CoverageObservation version) { }
+    private record CoverageView(View view, LegacyReviewHistoryModel model, long generation) { }
+    private static java.util.ConcurrentModificationException changedCoverage() {
+        return new java.util.ConcurrentModificationException("Review history changed during coverage calculation");
+    }
+    private static void requireCurrent(CoverageRoot observed) {
+        if (!observed.version.equals(observed.session.repository.coverageObservation())) throw changedCoverage();
+    }
+
+    private <T> CompletableFuture<T> coverageQuery(Project project, Supplier<T> query) {
+        var result = new CompletableFuture<T>();
+        coverageQueries.add(result);
+        result.whenComplete((value, failure) -> coverageQueries.remove(result));
+        try {
+            if (disposed || project.isDisposed()) throw new CancellationException("Project or history storage closed");
+            worker.execute(() -> {
+                if (result.isDone()) return;
+                try {
+                    if (disposed || project.isDisposed()) throw new CancellationException("Project or history storage closed");
+                    result.complete(query.get());
+                } catch (Throwable failure) { result.completeExceptionally(failure); }
+            });
+        } catch (Throwable failure) { result.completeExceptionally(failure); }
+        return result;
+    }
+
     private record Key(Project project, String path) { }
     private record SessionKey(Project project, Path root) { }
     private static final class Session {
         final SharedHistoryRepository repository;
         final SharedHistoryRepository.Author author;
-        Session(Path root) {
+        boolean live;
+        Session(Path root, boolean live) {
+            this.live = live;
             repository = new SharedHistoryRepository(root, ReviewRepositoryPaths.databasePath(root));
             author = new SharedHistoryRepository.Author(gitConfig(root, "user.name", System.getProperty("user.name", "Unknown author")),
                     gitConfig(root, "user.email", ""));
@@ -189,8 +328,13 @@ final class SharedReviewHistoryStore implements Disposable {
     }
 
     private Session session(Path root, Project project) {
+        return session(root, project, true);
+    }
+    private Session session(Path root, Project project, boolean live) {
         projectRoots.computeIfAbsent(project, ignored -> new HashSet<>()).add(root);
-        return sessions.computeIfAbsent(new SessionKey(project, root), ignored -> new Session(root));
+        var session = sessions.computeIfAbsent(new SessionKey(project, root), ignored -> new Session(root, live));
+        if (live) session.live = true;
+        return session;
     }
     private void load(View view) {
         var project = view.key.project;
@@ -489,11 +633,14 @@ final class SharedReviewHistoryStore implements Disposable {
     }
     @Override public void dispose() {
         if (disposed) return;
+        for (var query : coverageQueries) query.completeExceptionally(new CancellationException("History storage closed"));
         // Already queued pending writes finish before connection closure; no JDBC work on EDT.
         worker.execute(() -> {
             try {
             for (var session : sessions.values()) {
-                try { session.repository.flushAllPending(session.repository.checkoutToken()); }
+                // A report may inspect durable pending work without adopting editor ownership.
+                // Closing such a read-only session must not publish work it never loaded.
+                try { if (session.live) session.repository.flushAllPending(session.repository.checkoutToken()); }
                 catch (RuntimeException failure) { LOG.warn("Retained unflushed DoReview pending journal", failure); }
                 session.repository.close();
             }

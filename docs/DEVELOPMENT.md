@@ -69,6 +69,7 @@ The Windows helper forwards Gradle arguments through `-Tasks`, for example `.\bu
 - **Branch isolation:** `SharedHistoryCheckoutTest` covers branch bases, restarts, native deletions, failed first visits, owner-reservation failures and two-connection SQLite reconciliation. `SharedReviewHistoryStoreTest.testGitBranchInheritsUnchangedLinesAndRestoresEachBranchesExplicitRevocations` exercises the complete editor/storage path across source changes, clears and coordinator restarts.
 - **Projection lifecycle:** service, scheduler and projection-computer suites cover edit ordering, stale delivery, frozen clear commands, cancellation and disposal. Context suites cover adapter replacement, fingerprints, guard boundaries and syntax recovery.
 - **Presentation and metadata:** stripe, authors, shortcuts, widget and metadata suites protect rendering, split-editor ownership, navigation and installed plugin identities. CodeGlance has its separate optional suite below.
+- **Selection coverage:** `ReviewSelectionCoverageTest` covers weighted totals, recursive/overlapping selections, unsaved text, blanks, excluded/binary/metadata/oversized entries, action availability without an editor and cancellation. `ReviewCoverageHistoryTest` verifies read-only cold pending reads, warm marks, mutation guards and future completion on disposal.
 
 The regular build excludes `ContractCorpusAuditTest`. To run it against a local source corpus, provide the corpus directory explicitly:
 

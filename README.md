@@ -11,6 +11,7 @@ Track reviewed lines and share review history with your team through Git.
 - Use Git's line diff in Git repositories, including unsaved document changes, with version comparison and deleted-line indicators.
 - Keep review history across edits and Undo/Redo. New branches inherit the preceding branch's marks; returning to a branch restores its own history. Explicit clears remain effective in their branch.
 - Refresh shared history in the background while keeping still-valid highlights visible.
+- View combined review coverage for selected files or folders in the Project tool window.
 - Show an optional review stripe aligned with the CodeGlance minimap, or a whole-file overview when CodeGlance is unavailable.
 
 ## Usage
@@ -30,6 +31,10 @@ Outside Git, yellow marks require review because syntax context changed or a mat
 The **DoReview** menu provides version comparison, history management and **Show DoReview Stripe**. Stripe visibility is saved per project and is off by default.
 
 Use **Clear Review in Selection** or **Clear All Reviews in File** to revoke existing evidence. Returning to an older version of the text does not undo an explicit clear; marking it again creates a new review. Review coverage counts nonblank lines only.
+
+To see combined coverage, select files or a folder in the **Project** tool window, then right-click → **DoReview → Show Selection Review Coverage**. Folders include nested files; overlapping selections count each file once. The result shows the total reviewed percentage, reviewed/total nonblank lines, files included and lines that need review. For example, one reviewed line in a one-line file plus an unreviewed nine-line file gives **10%** combined coverage.
+
+The calculation runs in the background and can be cancelled. It uses unsaved document text without opening editors, saving source or publishing review history. Binary files, symbolic links, IDE-excluded paths, `.git`, `.doreview`, `.idea` and files above 8 MiB on disk or as normalized UTF-8 document text are skipped, with a skipped-entry count in the result. Files without any marks still contribute to the total. If files or review history change during the calculation, run it again to obtain a consistent result.
 
 Version comparison always opens the saved reviewed snapshot. A matching Git commit's hash and subject identify versions whose full file text matches after line-ending normalization; review dates and reviewers remain separate. Other versions are labelled **DoReview snapshot**, including imported or unsaved text without a matching Git revision.
 

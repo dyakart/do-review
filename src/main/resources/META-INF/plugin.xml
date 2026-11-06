@@ -36,6 +36,11 @@
     </extensions>
 
     <actions>
+        <group id="ReviewMarks.ProjectGroup" text="DoReview" popup="true">
+            <add-to-group group-id="ProjectViewPopupMenu" anchor="last"/>
+            <action id="ReviewMarks.SelectionCoverage" class="dev.doreview.ide.ShowSelectionCoverageAction"
+                    text="Show Selection Review Coverage" description="Show combined review coverage for selected files and folders"/>
+        </group>
         <group id="ReviewMarks.EditorGroup" text="DoReview" popup="true">
             <add-to-group group-id="EditorPopupMenu" anchor="last"/>
             <action id="ReviewMarks.Mark" class="dev.doreview.ide.MarkReviewedAction"

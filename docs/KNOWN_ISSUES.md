@@ -120,3 +120,9 @@ Validation on 2026-11-05 used the same isolated Java 25/PyCharm 2026.2.3 environ
 See [Development](DEVELOPMENT.md) for the full build command, isolated test-data paths and focused test suites. Synthetic performance fixtures check output and bounds; their timings do not establish real-project latency or retained-memory guarantees. A compatible local CodeGlance plugin and a source corpus were unavailable, so those optional checks were not run.
 
 Git projection has bounded input/output and a three-second aggregate process deadline. If Git is unavailable, input exceeds these limits or computation fails, saved evidence remains intact and newly inferred marks are withheld. Existing exact-snapshot facts can remain confirmed. Git executable availability and filesystem hard-link support are runtime requirements.
+
+## Selection coverage validation
+
+Validation on 2026-11-06 ran 426 JUnit tests: 424 passed, with the same DOR-002/DOR-003 failures, zero errors and zero skipped tests. All 19 added selection/history-reader tests passed. They cover weighted line counts, recursive and overlapping selection, unsaved text, real Git mapping, changed file/folder membership, cancellation, exclusions, cold pending reads without publication (including disposal), stale warm history and checkout changes. All 9,617 standalone core checks, core isolation, plugin archive creation and plugin-structure verification passed. No existing assertions were removed or weakened.
+
+Selection coverage is an on-demand snapshot, not a live aggregate widget. Unsupported entries and files above 8 MiB on disk or as normalized UTF-8 document text are skipped and counted explicitly. If inputs change during calculation, the report asks the user to run it again. Actual installed-IDE interaction and optional CodeGlance integration remain unverified.
