@@ -28,7 +28,7 @@ jobs:
         with:
           distribution: temurin
           java-version: '25'
-      - uses: gradle/actions/setup-gradle@7ca78c16c887dc6c5f36fd6d0cb0f5c23d940e69 # v6
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6
         with:
           cache-read-only: ${{ github.event_name == 'pull_request' }}
       - name: Test, package and validate plugin structure
